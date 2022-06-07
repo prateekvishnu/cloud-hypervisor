@@ -4,9 +4,6 @@ project: cloud-hypervisor
 # Target name (should be unique within the project)
 target: vhdx
 
-# Base image to run the binary in.
-# image: ghcr.io/prateekvishnu/cloud-hypervisor:latest
-
 # List of commands used to test the target
 cmds:
 
