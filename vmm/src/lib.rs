@@ -9,8 +9,6 @@ extern crate event_monitor;
 extern crate lazy_static;
 #[macro_use]
 extern crate log;
-#[macro_use]
-extern crate serde_derive;
 
 use crate::api::{
     ApiError, ApiRequest, ApiResponse, ApiResponsePayload, VmInfo, VmReceiveMigrationData,
@@ -20,6 +18,8 @@ use crate::config::{
     add_to_config, DeviceConfig, DiskConfig, FsConfig, NetConfig, PmemConfig, RestoreConfig,
     UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
 };
+#[cfg(feature = "guest_debug")]
+use crate::coredump::GuestDebuggable;
 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
 use crate::migration::get_vm_snapshot;
 use crate::migration::{recv_vm_config, recv_vm_state};
@@ -30,7 +30,8 @@ use libc::EFD_NONBLOCK;
 use memory_manager::MemoryManagerSnapshotData;
 use pci::PciBdf;
 use seccompiler::{apply_filter, SeccompAction};
-use serde::ser::{Serialize, SerializeStruct, Serializer};
+use serde::ser::{SerializeStruct, Serializer};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
@@ -53,6 +54,8 @@ mod acpi;
 pub mod api;
 mod clone3;
 pub mod config;
+#[cfg(feature = "guest_debug")]
+mod coredump;
 pub mod cpu;
 pub mod device_manager;
 pub mod device_tree;
@@ -340,7 +343,7 @@ pub fn start_vmm_thread(
 struct VmMigrationConfig {
     vm_config: Arc<Mutex<VmConfig>>,
     #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
-    common_cpuid: hypervisor::CpuId,
+    common_cpuid: hypervisor::x86_64::CpuId,
     memory_manager_data: MemoryManagerSnapshotData,
 }
 
@@ -558,6 +561,15 @@ impl Vmm {
             vm.restore(snapshot).map_err(VmError::Restore)
         } else {
             Err(VmError::VmNotCreated)
+        }
+    }
+
+    #[cfg(feature = "guest_debug")]
+    fn vm_coredump(&mut self, destination_url: &str) -> result::Result<(), VmError> {
+        if let Some(ref mut vm) = self.vm {
+            vm.coredump(destination_url).map_err(VmError::Coredump)
+        } else {
+            Err(VmError::VmNotRunning)
         }
     }
 
@@ -1498,7 +1510,7 @@ impl Vmm {
     fn vm_check_cpuid_compatibility(
         &self,
         src_vm_config: &Arc<Mutex<VmConfig>>,
-        src_vm_cpuid: &hypervisor::CpuId,
+        src_vm_cpuid: &hypervisor::x86_64::CpuId,
     ) -> result::Result<(), MigratableError> {
         // We check the `CPUID` compatibility of between the source vm and destination, which is
         // mostly about feature compatibility and "topology/sgx" leaves are not relevant.
@@ -1679,6 +1691,15 @@ impl Vmm {
                                 let response = self
                                     .vm_restore(restore_data.as_ref().clone())
                                     .map_err(ApiError::VmRestore)
+                                    .map(|_| ApiResponsePayload::Empty);
+
+                                sender.send(response).map_err(Error::ApiResponseSend)?;
+                            }
+                            #[cfg(feature = "guest_debug")]
+                            ApiRequest::VmCoredump(coredump_data, sender) => {
+                                let response = self
+                                    .vm_coredump(&coredump_data.destination_url)
+                                    .map_err(ApiError::VmCoredump)
                                     .map(|_| ApiResponsePayload::Empty);
 
                                 sender.send(response).map_err(Error::ApiResponseSend)?;

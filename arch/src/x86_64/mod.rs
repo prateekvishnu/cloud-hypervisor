@@ -15,7 +15,8 @@ pub mod regs;
 use crate::GuestMemoryMmap;
 use crate::InitramfsConfig;
 use crate::RegionType;
-use hypervisor::{CpuId, CpuIdEntry, HypervisorError, CPUID_FLAG_VALID_INDEX};
+use hypervisor::x86_64::{CpuId, CpuIdEntry, CPUID_FLAG_VALID_INDEX};
+use hypervisor::HypervisorError;
 use linux_loader::loader::bootparam::boot_params;
 use linux_loader::loader::elf::start_info::{
     hvm_memmap_table_entry, hvm_modlist_entry, hvm_start_info,
@@ -743,7 +744,7 @@ pub fn generate_common_cpuid(
 }
 
 pub fn configure_vcpu(
-    fd: &Arc<dyn hypervisor::Vcpu>,
+    vcpu: &Arc<dyn hypervisor::Vcpu>,
     id: u8,
     kernel_entry_point: Option<EntryPoint>,
     vm_memory: &GuestMemoryAtomic<GuestMemoryMmap>,
@@ -755,23 +756,23 @@ pub fn configure_vcpu(
     CpuidPatch::set_cpuid_reg(&mut cpuid, 0xb, None, CpuidReg::EDX, u32::from(id));
     CpuidPatch::set_cpuid_reg(&mut cpuid, 0x1f, None, CpuidReg::EDX, u32::from(id));
 
-    fd.set_cpuid2(&cpuid)
+    vcpu.set_cpuid2(&cpuid)
         .map_err(|e| Error::SetSupportedCpusFailed(e.into()))?;
 
     if kvm_hyperv {
-        fd.enable_hyperv_synic().unwrap();
+        vcpu.enable_hyperv_synic().unwrap();
     }
 
-    regs::setup_msrs(fd).map_err(Error::MsrsConfiguration)?;
+    regs::setup_msrs(vcpu).map_err(Error::MsrsConfiguration)?;
     if let Some(kernel_entry_point) = kernel_entry_point {
         if let Some(entry_addr) = kernel_entry_point.entry_addr {
             // Safe to unwrap because this method is called after the VM is configured
-            regs::setup_regs(fd, entry_addr.raw_value()).map_err(Error::RegsConfiguration)?;
-            regs::setup_fpu(fd).map_err(Error::FpuConfiguration)?;
-            regs::setup_sregs(&vm_memory.memory(), fd).map_err(Error::SregsConfiguration)?;
+            regs::setup_regs(vcpu, entry_addr.raw_value()).map_err(Error::RegsConfiguration)?;
+            regs::setup_fpu(vcpu).map_err(Error::FpuConfiguration)?;
+            regs::setup_sregs(&vm_memory.memory(), vcpu).map_err(Error::SregsConfiguration)?;
         }
     }
-    interrupts::set_lint(fd).map_err(|e| Error::LocalIntConfiguration(e.into()))?;
+    interrupts::set_lint(vcpu).map_err(|e| Error::LocalIntConfiguration(e.into()))?;
     Ok(())
 }
 

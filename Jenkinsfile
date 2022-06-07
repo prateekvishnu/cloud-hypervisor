@@ -23,6 +23,19 @@ pipeline{
 						}
 					}
 				}
+				stage ('Check for fuzzer cargo files only changes') {
+					when {
+						expression {
+							return fuzzCargoFileOnly()
+						}
+					}
+					steps {
+						script {
+							runWorkers = false
+							echo "Fuzzer cargo files only changes, no need to run the CI"
+						}
+					}
+				}
 				stage ('Check for RFC/WIP builds') {
 					when {
   						changeRequest comparator: 'REGEXP', title: '.*(rfc|RFC|wip|WIP).*'
@@ -153,88 +166,6 @@ pipeline{
 						}
 					}
 				}
-				stage ('Worker build SGX') {
-					agent { node { label 'bionic-sgx' } }
-					when {
-						beforeAgent true
-						allOf {
-							branch 'main'
-							expression {
-								return runWorkers
-							}
-						}
-					}
-					stages {
-						stage ('Checkout') {
-							steps {
-								checkout scm
-							}
-						}
-						stage ('Run SGX integration tests') {
-							options {
-								timeout(time: 1, unit: 'HOURS')
-							}
-							steps {
-								sh "scripts/dev_cli.sh tests --integration-sgx"
-							}
-						}
-						stage ('Run SGX integration tests for musl') {
-							options {
-								timeout(time: 1, unit: 'HOURS')
-							}
-							steps {
-								sh "scripts/dev_cli.sh tests --integration-sgx --libc musl"
-							}
-						}
-					}
-					post {
-						always {
-							sh "sudo chown -R jenkins.jenkins ${WORKSPACE}"
-							deleteDir()
-						}
-					}
-				}
-				stage ('Worker build VFIO') {
-					agent { node { label 'bionic-vfio' } }
-					when {
-						beforeAgent true
-						allOf {
-							branch 'main'
-							expression {
-								return runWorkers
-							}
-						}
-					}
-					stages {
-						stage ('Checkout') {
-							steps {
-								checkout scm
-							}
-						}
-						stage ('Run VFIO integration tests') {
-							options {
-								timeout(time: 1, unit: 'HOURS')
-							}
-							steps {
-								sh "scripts/dev_cli.sh tests --integration-vfio"
-							}
-						}
-						stage ('Run VFIO integration tests for musl') {
-							options {
-								timeout(time: 1, unit: 'HOURS')
-							}
-							steps {
-								sh "scripts/dev_cli.sh tests --integration-vfio --libc musl"
-							}
-						}
-					}
-					post {
-						always {
-							sh "sudo chown -R jenkins.jenkins ${WORKSPACE}"
-							deleteDir()
-						}
-					}
-				}
 				stage ('Worker build - Windows guest') {
 					agent { node { label 'focal' } }
 					when {
@@ -315,39 +246,6 @@ pipeline{
 						}
 					}
 				}
-				stage ('Worker build - Metrics') {
-					agent { node { label 'focal-metrics' } }
-					when {
-						branch 'main'
-						beforeAgent true
-						expression {
-							return runWorkers
-						}
-					}
-					environment {
-						METRICS_PUBLISH_KEY = credentials('52e0945f-ce7a-43d1-87af-67d1d87cc40f')
-					}
-					stages {
-						stage ('Checkout') {
-							steps {
-								checkout scm
-							}
-						}
-						stage ('Run metrics tests') {
-							options {
-								timeout(time: 1, unit: 'HOURS')
-							}
-							steps {
-								sh 'scripts/dev_cli.sh tests --metrics -- -- --report-file /root/workloads/metrics.json'
-							}
-						}
-						stage ('Upload metrics report') {
-							steps {
-								sh 'curl -X PUT https://cloud-hypervisor-metrics.azurewebsites.net/api/publishmetrics -H "x-functions-key: $METRICS_PUBLISH_KEY" -T ~/workloads/metrics.json'
-							}
-						}
-					}
-				}
 			}
 		}
 	}
@@ -400,5 +298,16 @@ def boolean docsFileOnly() {
     return sh(
         returnStatus: true,
         script: "git diff --name-only origin/${env.CHANGE_TARGET}... | grep -v '\\.md'"
+    ) != 0
+}
+
+def boolean fuzzCargoFileOnly() {
+    if (env.CHANGE_TARGET == null) {
+        return false;
+    }
+
+    return sh(
+        returnStatus: true,
+        script: "git diff --name-only origin/${env.CHANGE_TARGET}... | grep -v -E 'fuzz\\/Cargo.(toml|lock)'"
     ) != 0
 }

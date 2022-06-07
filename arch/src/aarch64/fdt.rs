@@ -8,17 +8,18 @@
 
 use crate::{NumaNodes, PciSpaceInfo};
 use byteorder::{BigEndian, ByteOrder};
+use hypervisor::arch::aarch64::gic::Vgic;
 use std::cmp;
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::fmt::Debug;
 use std::result;
 use std::str;
+use std::sync::{Arc, Mutex};
 
 use super::super::DeviceType;
 use super::super::GuestMemoryMmap;
 use super::super::InitramfsConfig;
-use super::gic::GicDevice;
 use super::layout::{
     IRQ_BASE, MEM_32BIT_DEVICES_SIZE, MEM_32BIT_DEVICES_START, MEM_PCI_IO_SIZE, MEM_PCI_IO_START,
     PCI_HIGH_BASE, PCI_MMIO_CONFIG_SIZE_PER_SEGMENT,
@@ -90,7 +91,7 @@ pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: ::std::hash::BuildHash
     vcpu_mpidr: Vec<u64>,
     vcpu_topology: Option<(u8, u8, u8)>,
     device_info: &HashMap<(DeviceType, String), T, S>,
-    gic_device: &dyn GicDevice,
+    gic_device: &Arc<Mutex<dyn Vgic>>,
     initrd: &Option<InitramfsConfig>,
     pci_space_info: &[PciSpaceInfo],
     numa_nodes: &NumaNodes,
@@ -315,18 +316,18 @@ fn create_chosen_node(
     Ok(())
 }
 
-fn create_gic_node(fdt: &mut FdtWriter, gic_device: &dyn GicDevice) -> FdtWriterResult<()> {
-    let gic_reg_prop = gic_device.device_properties();
+fn create_gic_node(fdt: &mut FdtWriter, gic_device: &Arc<Mutex<dyn Vgic>>) -> FdtWriterResult<()> {
+    let gic_reg_prop = gic_device.lock().unwrap().device_properties();
 
     let intc_node = fdt.begin_node("intc")?;
 
-    fdt.property_string("compatible", gic_device.fdt_compatibility())?;
+    fdt.property_string("compatible", gic_device.lock().unwrap().fdt_compatibility())?;
     fdt.property_null("interrupt-controller")?;
     // "interrupt-cells" field specifies the number of cells needed to encode an
     // interrupt source. The type shall be a <u32> and the value shall be 3 if no PPI affinity description
     // is required.
     fdt.property_u32("#interrupt-cells", 3)?;
-    fdt.property_array_u64("reg", gic_reg_prop)?;
+    fdt.property_array_u64("reg", &gic_reg_prop)?;
     fdt.property_u32("phandle", GIC_PHANDLE)?;
     fdt.property_u32("#address-cells", 2)?;
     fdt.property_u32("#size-cells", 2)?;
@@ -334,18 +335,18 @@ fn create_gic_node(fdt: &mut FdtWriter, gic_device: &dyn GicDevice) -> FdtWriter
 
     let gic_intr_prop = [
         GIC_FDT_IRQ_TYPE_PPI,
-        gic_device.fdt_maint_irq(),
+        gic_device.lock().unwrap().fdt_maint_irq(),
         IRQ_TYPE_LEVEL_HI,
     ];
     fdt.property_array_u32("interrupts", &gic_intr_prop)?;
 
-    if gic_device.msi_compatible() {
+    if gic_device.lock().unwrap().msi_compatible() {
         let msic_node = fdt.begin_node("msic")?;
-        fdt.property_string("compatible", gic_device.msi_compatibility())?;
+        fdt.property_string("compatible", gic_device.lock().unwrap().msi_compatibility())?;
         fdt.property_null("msi-controller")?;
         fdt.property_u32("phandle", MSI_PHANDLE)?;
-        let msi_reg_prop = gic_device.msi_properties();
-        fdt.property_array_u64("reg", msi_reg_prop)?;
+        let msi_reg_prop = gic_device.lock().unwrap().msi_properties();
+        fdt.property_array_u64("reg", &msi_reg_prop)?;
         fdt.end_node(msic_node)?;
     }
 

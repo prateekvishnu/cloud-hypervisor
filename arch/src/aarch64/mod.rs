@@ -4,23 +4,19 @@
 
 /// Module for the flattened device tree.
 pub mod fdt;
-/// Module for the global interrupt controller configuration.
-pub mod gic;
 /// Layout for this aarch64 system.
 pub mod layout;
-/// Logic for configuring aarch64 registers.
-pub mod regs;
 /// Module for loading UEFI binary.
 pub mod uefi;
 
 pub use self::fdt::DeviceInfoForFdt;
 use crate::{DeviceType, GuestMemoryMmap, NumaNodes, PciSpaceInfo, RegionType};
-use gic::GicDevice;
+use hypervisor::arch::aarch64::gic::Vgic;
 use log::{log_enabled, Level};
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use vm_memory::{Address, GuestAddress, GuestMemory, GuestUsize};
 
 /// Errors thrown while configuring aarch64 system.
@@ -33,13 +29,13 @@ pub enum Error {
     WriteFdtToMemory(fdt::Error),
 
     /// Failed to create a GIC.
-    SetupGic(gic::Error),
+    SetupGic,
 
     /// Failed to compute the initramfs address.
     InitramfsAddress,
 
     /// Error configuring the general purpose registers
-    RegsConfiguration(regs::Error),
+    RegsConfiguration(hypervisor::HypervisorCpuError),
 
     /// Error configuring the MPIDR register
     VcpuRegMpidr(hypervisor::HypervisorCpuError),
@@ -64,16 +60,20 @@ pub struct EntryPoint {
 
 /// Configure the specified VCPU, and return its MPIDR.
 pub fn configure_vcpu(
-    fd: &Arc<dyn hypervisor::Vcpu>,
+    vcpu: &Arc<dyn hypervisor::Vcpu>,
     id: u8,
     kernel_entry_point: Option<EntryPoint>,
 ) -> super::Result<u64> {
     if let Some(kernel_entry_point) = kernel_entry_point {
-        regs::setup_regs(fd, id, kernel_entry_point.entry_addr.raw_value())
-            .map_err(Error::RegsConfiguration)?;
+        vcpu.setup_regs(
+            id,
+            kernel_entry_point.entry_addr.raw_value(),
+            super::layout::FDT_START.raw_value(),
+        )
+        .map_err(Error::RegsConfiguration)?;
     }
 
-    let mpidr = fd.read_mpidr().map_err(Error::VcpuRegMpidr)?;
+    let mpidr = vcpu.read_mpidr().map_err(Error::VcpuRegMpidr)?;
     Ok(mpidr)
 }
 
@@ -143,7 +143,7 @@ pub fn configure_system<T: DeviceInfoForFdt + Clone + Debug, S: ::std::hash::Bui
     initrd: &Option<super::InitramfsConfig>,
     pci_space_info: &[PciSpaceInfo],
     virtio_iommu_bdf: Option<u32>,
-    gic_device: &dyn GicDevice,
+    gic_device: &Arc<Mutex<dyn Vgic>>,
     numa_nodes: &NumaNodes,
     pmu_supported: bool,
 ) -> super::Result<()> {

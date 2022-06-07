@@ -12,6 +12,12 @@
 //
 
 use crate::config::CpusConfig;
+#[cfg(feature = "guest_debug")]
+use crate::coredump::{
+    CpuElf64Writable, CpuSegment, CpuState as DumpCpusState, DumpState, Elf64Writable,
+    GuestDebuggableError, NoteDescType, X86_64ElfPrStatus, X86_64UserRegs, COREDUMP_NAME_SIZE,
+    NT_PRSTATUS,
+};
 use crate::device_manager::DeviceManager;
 #[cfg(feature = "gdb")]
 use crate::gdb::{get_raw_tid, Debuggable, DebuggableError};
@@ -28,24 +34,36 @@ use arch::NumaNodes;
 use devices::interrupt_controller::InterruptController;
 #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
 use gdbstub_arch::x86::reg::{X86SegmentRegs, X86_64CoreRegs};
+#[cfg(feature = "guest_debug")]
+use hypervisor::arch::x86::msr_index;
 #[cfg(target_arch = "aarch64")]
 use hypervisor::kvm::kvm_bindings;
+#[cfg(feature = "tdx")]
+use hypervisor::kvm::{TdxExitDetails, TdxExitStatus};
+#[cfg(target_arch = "x86_64")]
+use hypervisor::x86_64::CpuId;
+#[cfg(feature = "guest_debug")]
+use hypervisor::x86_64::{MsrEntries, MsrEntry};
 #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
 use hypervisor::x86_64::{SpecialRegisters, StandardRegisters};
-#[cfg(target_arch = "x86_64")]
-use hypervisor::CpuId;
-use hypervisor::{vm::VmmOps, CpuState, HypervisorCpuError, VmExit};
-#[cfg(feature = "tdx")]
-use hypervisor::{TdxExitDetails, TdxExitStatus};
+use hypervisor::{CpuState, HypervisorCpuError, VmExit, VmOps};
 use libc::{c_void, siginfo_t};
+#[cfg(feature = "guest_debug")]
+use linux_loader::elf::Elf64_Nhdr;
 use seccompiler::{apply_filter, SeccompAction};
 use std::collections::BTreeMap;
+#[cfg(feature = "guest_debug")]
+use std::io::Write;
+#[cfg(feature = "guest_debug")]
+use std::mem::size_of;
 use std::os::unix::thread::JoinHandleExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::{cmp, io, result, thread};
 use thiserror::Error;
 use vm_device::BusDevice;
+#[cfg(feature = "guest_debug")]
+use vm_memory::ByteValued;
 #[cfg(feature = "gdb")]
 use vm_memory::{Bytes, GuestAddressSpace};
 use vm_memory::{GuestAddress, GuestMemoryAtomic};
@@ -238,6 +256,13 @@ struct InterruptSourceOverride {
     pub flags: u16,
 }
 
+#[cfg(feature = "guest_debug")]
+macro_rules! round_up {
+    ($n:expr,$d:expr) => {
+        (($n / ($d + 1)) + 1) * $d
+    };
+}
+
 /// A wrapper around creating and using a kvm-based VCPU.
 pub struct Vcpu {
     // The hypervisor abstracted CPU.
@@ -255,14 +280,14 @@ impl Vcpu {
     ///
     /// * `id` - Represents the CPU number between [0, max vcpus).
     /// * `vm` - The virtual machine this vcpu will get attached to.
-    /// * `vmmops` - Optional object for exit handling.
+    /// * `vm_ops` - Optional object for exit handling.
     pub fn new(
         id: u8,
         vm: &Arc<dyn hypervisor::Vm>,
-        vmmops: Option<Arc<dyn VmmOps>>,
+        vm_ops: Option<Arc<dyn VmOps>>,
     ) -> Result<Self> {
         let vcpu = vm
-            .create_vcpu(id, vmmops)
+            .create_vcpu(id, vm_ops)
             .map_err(|e| Error::VcpuCreate(e.into()))?;
         // Initially the cpuid per vCPU is the one supported by this VM.
         Ok(Vcpu {
@@ -350,43 +375,38 @@ impl Vcpu {
 }
 
 const VCPU_SNAPSHOT_ID: &str = "vcpu";
-impl Pausable for Vcpu {
-    fn pause(&mut self) -> std::result::Result<(), MigratableError> {
-        self.saved_state =
-            Some(self.vcpu.state().map_err(|e| {
-                MigratableError::Pause(anyhow!("Could not get vCPU state {:?}", e))
-            })?);
-
-        Ok(())
-    }
-
-    fn resume(&mut self) -> std::result::Result<(), MigratableError> {
-        if let Some(vcpu_state) = &self.saved_state {
-            self.vcpu.set_state(vcpu_state).map_err(|e| {
-                MigratableError::Pause(anyhow!("Could not set the vCPU state {:?}", e))
-            })?;
-        }
-
-        Ok(())
-    }
-}
+impl Pausable for Vcpu {}
 impl Snapshottable for Vcpu {
     fn id(&self) -> String {
         VCPU_SNAPSHOT_ID.to_string()
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
+        let saved_state = self
+            .vcpu
+            .state()
+            .map_err(|e| MigratableError::Pause(anyhow!("Could not get vCPU state {:?}", e)))?;
+
         let mut vcpu_snapshot = Snapshot::new(&format!("{}", self.id));
         vcpu_snapshot.add_data_section(SnapshotDataSection::new_from_state(
             VCPU_SNAPSHOT_ID,
-            &self.saved_state,
+            &saved_state,
         )?);
+
+        self.saved_state = Some(saved_state);
 
         Ok(vcpu_snapshot)
     }
 
     fn restore(&mut self, snapshot: Snapshot) -> std::result::Result<(), MigratableError> {
-        self.saved_state = Some(snapshot.to_state(VCPU_SNAPSHOT_ID)?);
+        let saved_state: CpuState = snapshot.to_state(VCPU_SNAPSHOT_ID)?;
+
+        self.vcpu
+            .set_state(&saved_state)
+            .map_err(|e| MigratableError::Pause(anyhow!("Could not set the vCPU state {:?}", e)))?;
+
+        self.saved_state = Some(saved_state);
+
         Ok(())
     }
 }
@@ -412,7 +432,7 @@ pub struct CpuManager {
     selected_cpu: u8,
     vcpus: Vec<Arc<Mutex<Vcpu>>>,
     seccomp_action: SeccompAction,
-    vmmops: Arc<dyn VmmOps>,
+    vm_ops: Arc<dyn VmOps>,
     #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
     acpi_address: Option<GuestAddress>,
     proximity_domain_per_cpu: BTreeMap<u8, u32>,
@@ -562,7 +582,7 @@ impl CpuManager {
         #[cfg(feature = "gdb")] vm_debug_evt: EventFd,
         hypervisor: Arc<dyn hypervisor::Hypervisor>,
         seccomp_action: SeccompAction,
-        vmmops: Arc<dyn VmmOps>,
+        vm_ops: Arc<dyn VmOps>,
         #[cfg(feature = "tdx")] tdx_enabled: bool,
         numa_nodes: &NumaNodes,
     ) -> Result<Arc<Mutex<CpuManager>>> {
@@ -684,7 +704,7 @@ impl CpuManager {
             selected_cpu: 0,
             vcpus: Vec::with_capacity(usize::from(config.max_vcpus)),
             seccomp_action,
-            vmmops,
+            vm_ops,
             acpi_address,
             proximity_domain_per_cpu,
             affinity,
@@ -713,7 +733,7 @@ impl CpuManager {
     ) -> Result<()> {
         info!("Creating vCPU: cpu_id = {}", cpu_id);
 
-        let mut vcpu = Vcpu::new(cpu_id, &self.vm, Some(self.vmmops.clone()))?;
+        let mut vcpu = Vcpu::new(cpu_id, &self.vm, Some(self.vm_ops.clone()))?;
 
         if let Some(snapshot) = snapshot {
             // AArch64 vCPUs should be initialized after created.
@@ -989,8 +1009,8 @@ impl CpuManager {
                                     }
                                     #[cfg(feature = "tdx")]
                                     VmExit::Tdx => {
-                                        if let Some(vcpu_fd) = Arc::get_mut(&mut vcpu.vcpu) {
-                                            match vcpu_fd.get_tdx_exit_details() {
+                                        if let Some(vcpu) = Arc::get_mut(&mut vcpu.vcpu) {
+                                            match vcpu.get_tdx_exit_details() {
                                                 Ok(details) => match details {
                                                     TdxExitDetails::GetQuote => warn!("TDG_VP_VMCALL_GET_QUOTE not supported"),
                                                     TdxExitDetails::SetupEventNotifyInterrupt => {
@@ -999,7 +1019,7 @@ impl CpuManager {
                                                 },
                                                 Err(e) => error!("Unexpected TDX VMCALL: {}", e),
                                             }
-                                            vcpu_fd.set_tdx_status(TdxExitStatus::InvalidOperand);
+                                            vcpu.set_tdx_status(TdxExitStatus::InvalidOperand);
                                         } else {
                                             // We should never reach this code as
                                             // this means the design from the code
@@ -2097,6 +2117,217 @@ impl Debuggable for CpuManager {
     }
 }
 
+#[cfg(feature = "guest_debug")]
+impl Elf64Writable for CpuManager {}
+
+#[cfg(feature = "guest_debug")]
+impl CpuElf64Writable for CpuManager {
+    fn cpu_write_elf64_note(
+        &mut self,
+        dump_state: &DumpState,
+    ) -> std::result::Result<(), GuestDebuggableError> {
+        let mut coredump_file = dump_state.file.as_ref().unwrap();
+        for vcpu in &self.vcpus {
+            let note_size = self.get_note_size(NoteDescType::ElfDesc, 1);
+            let mut pos: usize = 0;
+            let mut buf = vec![0 as u8; note_size as usize];
+            let descsz = size_of::<X86_64ElfPrStatus>();
+            let vcpu_id = vcpu.lock().unwrap().id;
+
+            let note = Elf64_Nhdr {
+                n_namesz: COREDUMP_NAME_SIZE,
+                n_descsz: descsz as u32,
+                n_type: NT_PRSTATUS,
+            };
+
+            let bytes: &[u8] = note.as_slice();
+            buf.splice(0.., bytes.to_vec());
+            pos += round_up!(size_of::<Elf64_Nhdr>(), 4);
+            buf.resize(pos + 4, 0);
+            buf.splice(pos.., "CORE".to_string().into_bytes());
+
+            pos += round_up!(COREDUMP_NAME_SIZE as usize, 4);
+            buf.resize(pos + 32 + 4, 0);
+            let pid = vcpu_id as u64;
+            let bytes: &[u8] = pid.as_slice();
+            buf.splice(pos + 32.., bytes.to_vec()); /* pr_pid */
+
+            pos += descsz - size_of::<X86_64UserRegs>() - size_of::<u64>();
+
+            let orig_rax: u64 = 0;
+            let gregs = self.vcpus[usize::from(vcpu_id)]
+                .lock()
+                .unwrap()
+                .vcpu
+                .get_regs()
+                .map_err(|_e| GuestDebuggableError::Coredump(anyhow!("get regs failed")))?;
+
+            let regs1 = [
+                gregs.r15, gregs.r14, gregs.r13, gregs.r12, gregs.rbp, gregs.rbx, gregs.r11,
+                gregs.r10,
+            ];
+            let regs2 = [
+                gregs.r9, gregs.r8, gregs.rax, gregs.rcx, gregs.rdx, gregs.rsi, gregs.rdi, orig_rax,
+            ];
+
+            let sregs = self.vcpus[usize::from(vcpu_id)]
+                .lock()
+                .unwrap()
+                .vcpu
+                .get_sregs()
+                .map_err(|_e| GuestDebuggableError::Coredump(anyhow!("get sregs failed")))?;
+
+            debug!(
+                "rip 0x{:x} rsp 0x{:x} gs 0x{:x} cs 0x{:x} ss 0x{:x} ds 0x{:x}",
+                gregs.rip,
+                gregs.rsp,
+                sregs.gs.base,
+                sregs.cs.selector,
+                sregs.ss.selector,
+                sregs.ds.selector,
+            );
+
+            let regs = X86_64UserRegs {
+                regs1,
+                regs2,
+                rip: gregs.rip,
+                cs: sregs.cs.selector as u64,
+                eflags: gregs.rflags,
+                rsp: gregs.rsp,
+                ss: sregs.ss.selector as u64,
+                fs_base: sregs.fs.base as u64,
+                gs_base: sregs.gs.base as u64,
+                ds: sregs.ds.selector as u64,
+                es: sregs.es.selector as u64,
+                fs: sregs.fs.selector as u64,
+                gs: sregs.gs.selector as u64,
+            };
+
+            // let bytes: &[u8] = unsafe { any_as_u8_slice(&regs) };
+            let bytes: &[u8] = regs.as_slice();
+            buf.resize(note_size as usize, 0);
+            buf.splice(pos.., bytes.to_vec());
+            buf.resize(note_size as usize, 0);
+
+            coredump_file
+                .write(&buf)
+                .map_err(|e| GuestDebuggableError::CoredumpFile(e.into()))?;
+        }
+
+        Ok(())
+    }
+
+    fn cpu_write_vmm_note(
+        &mut self,
+        dump_state: &DumpState,
+    ) -> std::result::Result<(), GuestDebuggableError> {
+        let mut coredump_file = dump_state.file.as_ref().unwrap();
+        for vcpu in &self.vcpus {
+            let note_size = self.get_note_size(NoteDescType::VmmDesc, 1);
+            let mut pos: usize = 0;
+            let mut buf = vec![0 as u8; note_size as usize];
+            let descsz = size_of::<DumpCpusState>();
+            let vcpu_id = vcpu.lock().unwrap().id;
+
+            let note = Elf64_Nhdr {
+                n_namesz: COREDUMP_NAME_SIZE,
+                n_descsz: descsz as u32,
+                n_type: 0 as u32,
+            };
+
+            let bytes: &[u8] = note.as_slice();
+            buf.splice(0.., bytes.to_vec());
+            pos += round_up!(size_of::<Elf64_Nhdr>(), 4);
+
+            buf.resize(pos + 4, 0);
+            buf.splice(pos.., "QEMU".to_string().into_bytes());
+
+            pos += round_up!(COREDUMP_NAME_SIZE as usize, 4);
+
+            let gregs = self.vcpus[usize::from(vcpu_id)]
+                .lock()
+                .unwrap()
+                .vcpu
+                .get_regs()
+                .map_err(|_e| GuestDebuggableError::Coredump(anyhow!("get regs failed")))?;
+
+            let regs1 = [
+                gregs.rax, gregs.rbx, gregs.rcx, gregs.rdx, gregs.rsi, gregs.rdi, gregs.rsp,
+                gregs.rbp,
+            ];
+
+            let regs2 = [
+                gregs.r8, gregs.r9, gregs.r10, gregs.r11, gregs.r12, gregs.r13, gregs.r14,
+                gregs.r15,
+            ];
+
+            let sregs = self.vcpus[usize::from(vcpu_id)]
+                .lock()
+                .unwrap()
+                .vcpu
+                .get_sregs()
+                .map_err(|_e| GuestDebuggableError::Coredump(anyhow!("get sregs failed")))?;
+
+            let mut msrs = MsrEntries::from_entries(&[MsrEntry {
+                index: msr_index::MSR_KERNEL_GS_BASE,
+                ..Default::default()
+            }])
+            .map_err(|_e| GuestDebuggableError::Coredump(anyhow!("get msr failed")))?;
+
+            self.vcpus[vcpu_id as usize]
+                .lock()
+                .unwrap()
+                .vcpu
+                .get_msrs(&mut msrs)
+                .map_err(|_e| GuestDebuggableError::Coredump(anyhow!("get msr failed")))?;
+            let kernel_gs_base = msrs.as_slice()[0].data;
+
+            let cs = CpuSegment::new(sregs.cs);
+            let ds = CpuSegment::new(sregs.ds);
+            let es = CpuSegment::new(sregs.es);
+            let fs = CpuSegment::new(sregs.fs);
+            let gs = CpuSegment::new(sregs.gs);
+            let ss = CpuSegment::new(sregs.ss);
+            let ldt = CpuSegment::new(sregs.ldt);
+            let tr = CpuSegment::new(sregs.tr);
+            let gdt = CpuSegment::new_from_table(sregs.gdt);
+            let idt = CpuSegment::new_from_table(sregs.idt);
+            let cr = [sregs.cr0, sregs.cr8, sregs.cr2, sregs.cr3, sregs.cr4];
+            let regs = DumpCpusState {
+                version: 1 as u32,
+                size: size_of::<DumpCpusState>() as u32,
+                regs1,
+                regs2,
+                rip: gregs.rip,
+                rflags: gregs.rflags,
+                cs,
+                ds,
+                es,
+                fs,
+                gs,
+                ss,
+                ldt,
+                tr,
+                gdt,
+                idt,
+                cr,
+                kernel_gs_base,
+            };
+
+            let bytes: &[u8] = regs.as_slice();
+            buf.resize(note_size as usize, 0);
+            buf.splice(pos.., bytes.to_vec());
+            buf.resize(note_size as usize, 0);
+
+            coredump_file
+                .write(&buf)
+                .map_err(|e| GuestDebuggableError::CoredumpFile(e.into()))?;
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
 #[cfg(test)]
 mod tests {
@@ -2205,7 +2436,7 @@ mod tests {
 #[cfg(target_arch = "aarch64")]
 #[cfg(test)]
 mod tests {
-    use arch::aarch64::regs::*;
+    use arch::layout;
     use hypervisor::kvm::aarch64::{is_system_register, MPIDR_EL1};
     use hypervisor::kvm::kvm_bindings::{
         kvm_one_reg, kvm_regs, kvm_vcpu_init, user_pt_regs, KVM_REG_ARM64, KVM_REG_ARM64_SYSREG,
@@ -2220,7 +2451,7 @@ mod tests {
         let vm = hv.create_vm().unwrap();
         let vcpu = vm.create_vcpu(0, None).unwrap();
 
-        let res = setup_regs(&vcpu, 0, 0x0);
+        let res = vcpu.setup_regs(0, 0x0, layout::FDT_START.0);
         // Must fail when vcpu is not initialized yet.
         assert!(res.is_err());
 
@@ -2228,7 +2459,7 @@ mod tests {
         vm.get_preferred_target(&mut kvi).unwrap();
         vcpu.vcpu_init(&kvi).unwrap();
 
-        assert!(setup_regs(&vcpu, 0, 0x0).is_ok());
+        assert!(vcpu.setup_regs(0, 0x0, layout::FDT_START.0).is_ok());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "cloud-hypervisor"
-version = "23.0.0"
+version = "24.0.0"
 authors = ["The Cloud Hypervisor Authors"]
 edition = "2021"
 default-run = "cloud-hypervisor"
@@ -10,7 +10,7 @@ description = "Open source Virtual Machine Monitor (VMM) that runs on top of KVM
 homepage = "https://github.com/cloud-hypervisor/cloud-hypervisor"
 # Minimum buildable version:
 # Keep in sync with version in .github/workflows/build.yaml
-rust-version = "1.56"
+rust-version = "1.60"
 
 [profile.release]
 lto = true
@@ -18,23 +18,23 @@ lto = true
 [dependencies]
 anyhow = "1.0.57"
 api_client = { path = "api_client" }
-clap = { version = "3.1.17", features = ["wrap_help","cargo"] }
+clap = { version = "3.1.18", features = ["wrap_help","cargo"] }
 epoll = "4.3.1"
 event_monitor = { path = "event_monitor" }
 hypervisor = { path = "hypervisor" }
-libc = "0.2.125"
+libc = "0.2.126"
 log = { version = "0.4.17", features = ["std"] }
 option_parser = { path = "option_parser" }
 seccompiler = "0.2.0"
 serde_json = "1.0.81"
-signal-hook = "0.3.13"
+signal-hook = "0.3.14"
 thiserror = "1.0.31"
 vmm = { path = "vmm" }
 vmm-sys-util = "0.9.0"
-vm-memory = "0.7.0"
+vm-memory = "0.8.0"
 
 [build-dependencies]
-clap = { version = "3.1.17", features = ["cargo"] }
+clap = { version = "3.1.18", features = ["cargo"] }
 
 # List of patched crates
 [patch.crates-io]
@@ -58,6 +58,7 @@ amx = ["vmm/amx"]
 cmos = ["vmm/cmos"]
 fwdebug = ["vmm/fwdebug"]
 gdb = ["vmm/gdb"]
+guest_debug = ["vmm/guest_debug"]
 kvm = ["vmm/kvm"]
 mshv = ["vmm/mshv"]
 tdx = ["vmm/tdx"]

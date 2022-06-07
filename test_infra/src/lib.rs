@@ -9,6 +9,7 @@ extern crate lazy_static;
 use ssh2::Session;
 use std::env;
 use std::ffi::OsStr;
+use std::fmt::Debug;
 use std::fs;
 use std::io;
 use std::io::{Read, Write};
@@ -1036,50 +1037,6 @@ impl Guest {
         Ok(false)
     }
 
-    pub fn valid_virtio_fs_cache_size(
-        &self,
-        dax: bool,
-        cache_size: Option<u64>,
-    ) -> Result<bool, Error> {
-        // SHM region is called different things depending on kernel
-        let shm_region = self
-            .ssh_command("sudo grep 'virtio[0-9]\\|virtio-pci-shm' /proc/iomem || true")?
-            .trim()
-            .to_string();
-
-        if shm_region.is_empty() {
-            return Ok(!dax);
-        }
-
-        // From this point, the region is not empty, hence it is an error
-        // if DAX is off.
-        if !dax {
-            return Ok(false);
-        }
-
-        let cache = if let Some(cache) = cache_size {
-            cache
-        } else {
-            // 8Gib by default
-            0x0002_0000_0000
-        };
-
-        let args: Vec<&str> = shm_region.split(':').collect();
-        if args.is_empty() {
-            return Ok(false);
-        }
-
-        let args: Vec<&str> = args[0].trim().split('-').collect();
-        if args.len() != 2 {
-            return Ok(false);
-        }
-
-        let start_addr = u64::from_str_radix(args[0], 16).map_err(Error::Parsing)?;
-        let end_addr = u64::from_str_radix(args[1], 16).map_err(Error::Parsing)?;
-
-        Ok(cache == (end_addr - start_addr + 1))
-    }
-
     pub fn check_vsock(&self, socket: &str) {
         // Listen from guest on vsock CID=3 PORT=16
         // SOCKET-LISTEN:<domain>:<protocol>:<local-address>
@@ -1220,11 +1177,35 @@ impl Guest {
     }
 }
 
+pub enum VerbosityLevel {
+    Warn,
+    Info,
+    Debug,
+}
+
+impl Default for VerbosityLevel {
+    fn default() -> Self {
+        Self::Warn
+    }
+}
+
+impl ToString for VerbosityLevel {
+    fn to_string(&self) -> String {
+        use VerbosityLevel::*;
+        match self {
+            Warn => "".to_string(),
+            Info => "-v".to_string(),
+            Debug => "-vv".to_string(),
+        }
+    }
+}
+
 pub struct GuestCommand<'a> {
     command: Command,
     guest: &'a Guest,
     capture_output: bool,
     print_cmd: bool,
+    verbosity: VerbosityLevel,
 }
 
 impl<'a> GuestCommand<'a> {
@@ -1238,7 +1219,13 @@ impl<'a> GuestCommand<'a> {
             guest,
             capture_output: false,
             print_cmd: true,
+            verbosity: VerbosityLevel::Info,
         }
+    }
+
+    pub fn verbosity(&mut self, verbosity: VerbosityLevel) -> &mut Self {
+        self.verbosity = verbosity;
+        self
     }
 
     pub fn capture_output(&mut self) -> &mut Self {
@@ -1252,6 +1239,17 @@ impl<'a> GuestCommand<'a> {
     }
 
     pub fn spawn(&mut self) -> io::Result<Child> {
+        use VerbosityLevel::*;
+        match &self.verbosity {
+            Warn => {}
+            Info => {
+                self.command.arg("-v");
+            }
+            Debug => {
+                self.command.arg("-vv");
+            }
+        };
+
         if self.print_cmd {
             println!(
                 "\n\n==== Start cloud-hypervisor command-line ====\n\n\
@@ -1264,7 +1262,6 @@ impl<'a> GuestCommand<'a> {
         if self.capture_output {
             let child = self
                 .command
-                .arg("-v")
                 .stderr(Stdio::piped())
                 .stdout(Stdio::piped())
                 .spawn()
@@ -1284,7 +1281,7 @@ impl<'a> GuestCommand<'a> {
                 ))
             }
         } else {
-            self.command.arg("-v").spawn()
+            self.command.spawn()
         }
     }
 

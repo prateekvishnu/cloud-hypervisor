@@ -14,11 +14,8 @@ use crate::config::{
     VdpaConfig, VhostMode, VmConfig, VsockConfig,
 };
 use crate::device_tree::{DeviceNode, DeviceTree};
-#[cfg(feature = "kvm")]
-use crate::interrupt::kvm::KvmMsiInterruptManager as MsiInterruptManager;
-#[cfg(feature = "mshv")]
-use crate::interrupt::mshv::MshvMsiInterruptManager as MsiInterruptManager;
 use crate::interrupt::LegacyUserspaceInterruptManager;
+use crate::interrupt::MsiInterruptManager;
 use crate::memory_manager::MEMORY_MANAGER_ACPI_SIZE;
 use crate::memory_manager::{Error as MemoryManagerError, MemoryManager};
 use crate::pci_segment::PciSegment;
@@ -32,8 +29,6 @@ use crate::PciDeviceInfo;
 use crate::{device_node, DEVICE_MANAGER_SNAPSHOT_ID};
 use acpi_tables::{aml, aml::Aml};
 use anyhow::anyhow;
-#[cfg(target_arch = "aarch64")]
-use arch::aarch64::gic::gicv3_its::kvm::KvmGicV3Its;
 use arch::layout;
 #[cfg(target_arch = "x86_64")]
 use arch::layout::{APIC_START, IOAPIC_SIZE, IOAPIC_START};
@@ -56,11 +51,7 @@ use devices::legacy::Serial;
 use devices::{
     interrupt_controller, interrupt_controller::InterruptController, AcpiNotificationFlags,
 };
-#[cfg(feature = "kvm")]
-use hypervisor::kvm_ioctls::*;
-use hypervisor::DeviceFd;
-#[cfg(feature = "mshv")]
-use hypervisor::IoEventAddress;
+use hypervisor::{DeviceFd, HypervisorVmError, IoEventAddress};
 use libc::{
     cfmakeraw, isatty, tcgetattr, tcsetattr, termios, MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED,
     O_TMPFILE, PROT_READ, PROT_WRITE, TCSANOW,
@@ -72,6 +63,7 @@ use pci::{
     VfioUserPciDevice, VfioUserPciDeviceError,
 };
 use seccompiler::SeccompAction;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::convert::TryInto;
 use std::fs::{read_link, File, OpenOptions};
@@ -85,12 +77,13 @@ use std::result;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use vfio_ioctls::{VfioContainer, VfioDevice};
-use virtio_devices::transport::VirtioPciDevice;
 use virtio_devices::transport::VirtioTransport;
+use virtio_devices::transport::{VirtioPciDevice, VirtioPciDeviceActivator};
 use virtio_devices::vhost_user::VhostUserConfig;
-use virtio_devices::{AccessPlatformMapping, VdpaDmaMapping, VirtioMemMappingSource};
+use virtio_devices::{
+    AccessPlatformMapping, ActivateError, VdpaDmaMapping, VirtioMemMappingSource,
+};
 use virtio_devices::{Endpoint, IommuMapping};
-use virtio_devices::{VirtioSharedMemory, VirtioSharedMemoryList};
 use vm_allocator::{AddressAllocator, SystemAllocator};
 use vm_device::dma_mapping::vfio::VfioDmaMapping;
 use vm_device::dma_mapping::ExternalDmaMapping;
@@ -475,13 +468,16 @@ pub enum DeviceManagerError {
     InvalidIommuHotplug,
 
     /// Failed to create UEFI flash
-    CreateUefiFlash(hypervisor::vm::HypervisorVmError),
+    CreateUefiFlash(HypervisorVmError),
 
     /// Invalid identifier as it is not unique.
     IdentifierNotUnique(String),
 
     /// Invalid identifier
     InvalidIdentifier(String),
+
+    /// Error activating virtio device
+    VirtioActivate(ActivateError),
 }
 pub type DeviceManagerResult<T> = result::Result<T, DeviceManagerError>;
 
@@ -945,6 +941,9 @@ pub struct DeviceManager {
 
     // Start time of the VM
     timestamp: Instant,
+
+    // Pending activations
+    pending_activations: Arc<Mutex<Vec<VirtioPciDeviceActivator>>>,
 }
 
 impl DeviceManager {
@@ -1086,6 +1085,7 @@ impl DeviceManager {
             io_uring_supported: None,
             boot_id_list,
             timestamp,
+            pending_activations: Arc::new(Mutex::new(Vec::default())),
         };
 
         let device_manager = Arc::new(Mutex::new(device_manager));
@@ -2400,109 +2400,7 @@ impl DeviceManager {
 
         let mut node = device_node!(id);
 
-        // Look for the id in the device tree. If it can be found, that means
-        // the device is being restored, otherwise it's created from scratch.
-        let cache_range = if let Some(node) = self.device_tree.lock().unwrap().get(&id) {
-            info!("Restoring virtio-fs {} resources", id);
-
-            let mut cache_range: Option<(u64, u64)> = None;
-            for resource in node.resources.iter() {
-                match resource {
-                    Resource::MmioAddressRange { base, size } => {
-                        if cache_range.is_some() {
-                            return Err(DeviceManagerError::ResourceAlreadyExists);
-                        }
-
-                        cache_range = Some((*base, *size));
-                    }
-                    _ => {
-                        error!("Unexpected resource {:?} for {}", resource, id);
-                    }
-                }
-            }
-
-            cache_range
-        } else {
-            None
-        };
-
-        // DAX is not supported, we override the config by disabling the option.
-        fs_cfg.dax = false;
-
         if let Some(fs_socket) = fs_cfg.socket.to_str() {
-            let cache = if fs_cfg.dax {
-                let (cache_base, cache_size) = if let Some((base, size)) = cache_range {
-                    // The memory needs to be 2MiB aligned in order to support
-                    // hugepages.
-                    self.pci_segments[fs_cfg.pci_segment as usize]
-                        .allocator
-                        .lock()
-                        .unwrap()
-                        .allocate(
-                            Some(GuestAddress(base)),
-                            size as GuestUsize,
-                            Some(0x0020_0000),
-                        )
-                        .ok_or(DeviceManagerError::FsRangeAllocation)?;
-
-                    (base, size)
-                } else {
-                    let size = fs_cfg.cache_size;
-                    // The memory needs to be 2MiB aligned in order to support
-                    // hugepages.
-                    let base = self.pci_segments[fs_cfg.pci_segment as usize]
-                        .allocator
-                        .lock()
-                        .unwrap()
-                        .allocate(None, size as GuestUsize, Some(0x0020_0000))
-                        .ok_or(DeviceManagerError::FsRangeAllocation)?;
-
-                    (base.raw_value(), size)
-                };
-
-                // Update the node with correct resource information.
-                node.resources.push(Resource::MmioAddressRange {
-                    base: cache_base,
-                    size: cache_size,
-                });
-
-                let mmap_region = MmapRegion::build(
-                    None,
-                    cache_size as usize,
-                    libc::PROT_NONE,
-                    libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
-                )
-                .map_err(DeviceManagerError::NewMmapRegion)?;
-                let host_addr: u64 = mmap_region.as_ptr() as u64;
-
-                let mem_slot = self
-                    .memory_manager
-                    .lock()
-                    .unwrap()
-                    .create_userspace_mapping(
-                        cache_base, cache_size, host_addr, false, false, false,
-                    )
-                    .map_err(DeviceManagerError::MemoryManager)?;
-
-                let region_list = vec![VirtioSharedMemory {
-                    offset: 0,
-                    len: cache_size,
-                }];
-
-                Some((
-                    VirtioSharedMemoryList {
-                        host_addr,
-                        mem_slot,
-                        addr: GuestAddress(cache_base),
-                        len: cache_size as GuestUsize,
-                        region_list,
-                    },
-                    mmap_region,
-                ))
-            } else {
-                None
-            };
-
             let virtio_fs_device = Arc::new(Mutex::new(
                 virtio_devices::vhost_user::Fs::new(
                     id.clone(),
@@ -2510,7 +2408,7 @@ impl DeviceManager {
                     &fs_cfg.tag,
                     fs_cfg.num_queues,
                     fs_cfg.queue_size,
-                    cache,
+                    None,
                     self.seccomp_action.clone(),
                     self.restoring,
                     self.exit_evt
@@ -3526,6 +3424,7 @@ impl DeviceManager {
                 // The exception being if not on the default PCI segment.
                 pci_segment_id > 0 || device_type != VirtioDeviceType::Block as u32,
                 dma_handler,
+                self.pending_activations.clone(),
             )
             .map_err(DeviceManagerError::VirtioDevice)?,
         ));
@@ -3680,17 +3579,10 @@ impl DeviceManager {
     }
 
     pub fn activate_virtio_devices(&self) -> DeviceManagerResult<()> {
-        // Find virtio pci devices and activate any pending ones
-        let device_tree = self.device_tree.lock().unwrap();
-        for pci_device_node in device_tree.pci_devices() {
-            #[allow(irrefutable_let_patterns)]
-            if let PciDeviceHandle::Virtio(virtio_pci_device) = &pci_device_node
-                .pci_device_handle
-                .as_ref()
-                .ok_or(DeviceManagerError::MissingPciDevice)?
-            {
-                virtio_pci_device.lock().unwrap().maybe_activate();
-            }
+        for mut activator in self.pending_activations.lock().unwrap().drain(..) {
+            activator
+                .activate()
+                .map_err(DeviceManagerError::VirtioActivate)?;
         }
         Ok(())
     }
@@ -4433,26 +4325,11 @@ impl Pausable for DeviceManager {
         // and ITS tables to guest RAM.
         #[cfg(target_arch = "aarch64")]
         {
-            let gic_device = Arc::clone(
-                self.get_interrupt_controller()
-                    .unwrap()
-                    .lock()
-                    .unwrap()
-                    .get_gic_device()
-                    .unwrap(),
-            );
-            if let Some(gicv3_its) = gic_device
+            self.get_interrupt_controller()
+                .unwrap()
                 .lock()
                 .unwrap()
-                .as_any_concrete_mut()
-                .downcast_mut::<KvmGicV3Its>()
-            {
-                gicv3_its.pause()?;
-            } else {
-                return Err(MigratableError::Pause(anyhow!(
-                    "GicDevice downcast to KvmGicV3Its failed when pausing device manager!"
-                )));
-            };
+                .pause()?;
         };
 
         Ok(())

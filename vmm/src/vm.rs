@@ -16,6 +16,10 @@ use crate::config::{
     add_to_config, DeviceConfig, DiskConfig, FsConfig, HotplugMethod, NetConfig, PmemConfig,
     UserDeviceConfig, ValidationError, VdpaConfig, VmConfig, VsockConfig,
 };
+#[cfg(feature = "guest_debug")]
+use crate::coredump::{
+    CpuElf64Writable, DumpState, Elf64Writable, GuestDebuggable, GuestDebuggableError, NoteDescType,
+};
 use crate::cpu;
 use crate::device_manager::{Console, DeviceManager, DeviceManagerError, PtyPair};
 use crate::device_tree::DeviceTree;
@@ -24,6 +28,8 @@ use crate::gdb::{Debuggable, DebuggableError, GdbRequestPayload, GdbResponsePayl
 use crate::memory_manager::{
     Error as MemoryManagerError, MemoryManager, MemoryManagerSnapshotData,
 };
+#[cfg(feature = "guest_debug")]
+use crate::migration::url_to_file;
 use crate::migration::{get_vm_snapshot, url_to_path, SNAPSHOT_CONFIG_FILE, SNAPSHOT_STATE_FILE};
 use crate::seccomp_filters::{get_seccomp_filter, Thread};
 use crate::GuestMemoryMmap;
@@ -31,10 +37,6 @@ use crate::{
     PciDeviceInfo, CPU_MANAGER_SNAPSHOT_ID, DEVICE_MANAGER_SNAPSHOT_ID, MEMORY_MANAGER_SNAPSHOT_ID,
 };
 use anyhow::anyhow;
-#[cfg(target_arch = "aarch64")]
-use arch::aarch64::gic::gicv3_its::kvm::{KvmGicV3Its, GIC_V3_ITS_SNAPSHOT_ID};
-#[cfg(target_arch = "aarch64")]
-use arch::aarch64::gic::kvm::create_gic;
 use arch::get_host_cpu_phys_bits;
 #[cfg(target_arch = "x86_64")]
 use arch::layout::{KVM_IDENTITY_MAP_START, KVM_TSS_START};
@@ -45,18 +47,23 @@ use arch::EntryPoint;
 use arch::PciSpaceInfo;
 use arch::{NumaNode, NumaNodes};
 #[cfg(target_arch = "aarch64")]
+use devices::gic::GIC_V3_ITS_SNAPSHOT_ID;
+#[cfg(target_arch = "aarch64")]
 use devices::interrupt_controller::{self, InterruptController};
 use devices::AcpiNotificationFlags;
 #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
 use gdbstub_arch::x86::reg::X86_64CoreRegs;
-use hypervisor::vm::{HypervisorVmError, VmmOps};
+use hypervisor::{HypervisorVmError, VmOps};
 use linux_loader::cmdline::Cmdline;
+#[cfg(feature = "guest_debug")]
+use linux_loader::elf;
 #[cfg(target_arch = "x86_64")]
 use linux_loader::loader::elf::PvhBootCapability::PvhEntryPresent;
 #[cfg(target_arch = "aarch64")]
 use linux_loader::loader::pe::Error::InvalidImageMagicNumber;
 use linux_loader::loader::KernelLoader;
 use seccompiler::{apply_filter, SeccompAction};
+use serde::{Deserialize, Serialize};
 use signal_hook::{
     consts::{SIGINT, SIGTERM, SIGWINCH},
     iterator::backend::Handle,
@@ -71,6 +78,8 @@ use std::io::{self, Read, Write};
 use std::io::{Seek, SeekFrom};
 #[cfg(feature = "tdx")]
 use std::mem;
+#[cfg(feature = "guest_debug")]
+use std::mem::size_of;
 use std::num::Wrapping;
 use std::ops::Deref;
 use std::os::unix::net::UnixStream;
@@ -293,6 +302,10 @@ pub enum Error {
     #[cfg(target_arch = "x86_64")]
     #[error("Error joining kernel loading thread")]
     KernelLoadThreadJoin(std::boxed::Box<dyn std::any::Any + std::marker::Send>),
+
+    #[cfg(feature = "guest_debug")]
+    #[error("Error coredumping VM: {0:?}")]
+    Coredump(GuestDebuggableError),
 }
 pub type Result<T> = result::Result<T, Error>;
 
@@ -343,7 +356,7 @@ impl VmState {
     }
 }
 
-struct VmOps {
+struct VmOpsHandler {
     memory: GuestMemoryAtomic<GuestMemoryMmap>,
     #[cfg(target_arch = "x86_64")]
     io_bus: Arc<Bus>,
@@ -352,29 +365,29 @@ struct VmOps {
     pci_config_io: Arc<Mutex<dyn BusDevice>>,
 }
 
-impl VmmOps for VmOps {
-    fn guest_mem_write(&self, gpa: u64, buf: &[u8]) -> hypervisor::vm::Result<usize> {
+impl VmOps for VmOpsHandler {
+    fn guest_mem_write(&self, gpa: u64, buf: &[u8]) -> result::Result<usize, HypervisorVmError> {
         self.memory
             .memory()
             .write(buf, GuestAddress(gpa))
             .map_err(|e| HypervisorVmError::GuestMemWrite(e.into()))
     }
 
-    fn guest_mem_read(&self, gpa: u64, buf: &mut [u8]) -> hypervisor::vm::Result<usize> {
+    fn guest_mem_read(&self, gpa: u64, buf: &mut [u8]) -> result::Result<usize, HypervisorVmError> {
         self.memory
             .memory()
             .read(buf, GuestAddress(gpa))
             .map_err(|e| HypervisorVmError::GuestMemRead(e.into()))
     }
 
-    fn mmio_read(&self, gpa: u64, data: &mut [u8]) -> hypervisor::vm::Result<()> {
+    fn mmio_read(&self, gpa: u64, data: &mut [u8]) -> result::Result<(), HypervisorVmError> {
         if let Err(vm_device::BusError::MissingAddressRange) = self.mmio_bus.read(gpa, data) {
             warn!("Guest MMIO read to unregistered address 0x{:x}", gpa);
         }
         Ok(())
     }
 
-    fn mmio_write(&self, gpa: u64, data: &[u8]) -> hypervisor::vm::Result<()> {
+    fn mmio_write(&self, gpa: u64, data: &[u8]) -> result::Result<(), HypervisorVmError> {
         match self.mmio_bus.write(gpa, data) {
             Err(vm_device::BusError::MissingAddressRange) => {
                 warn!("Guest MMIO write to unregistered address 0x{:x}", gpa);
@@ -390,7 +403,7 @@ impl VmmOps for VmOps {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn pio_read(&self, port: u64, data: &mut [u8]) -> hypervisor::vm::Result<()> {
+    fn pio_read(&self, port: u64, data: &mut [u8]) -> result::Result<(), HypervisorVmError> {
         use pci::{PCI_CONFIG_IO_PORT, PCI_CONFIG_IO_PORT_SIZE};
 
         if (PCI_CONFIG_IO_PORT..(PCI_CONFIG_IO_PORT + PCI_CONFIG_IO_PORT_SIZE)).contains(&port) {
@@ -409,7 +422,7 @@ impl VmmOps for VmOps {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn pio_write(&self, port: u64, data: &[u8]) -> hypervisor::vm::Result<()> {
+    fn pio_write(&self, port: u64, data: &[u8]) -> result::Result<(), HypervisorVmError> {
         use pci::{PCI_CONFIG_IO_PORT, PCI_CONFIG_IO_PORT_SIZE};
 
         if (PCI_CONFIG_IO_PORT..(PCI_CONFIG_IO_PORT + PCI_CONFIG_IO_PORT_SIZE)).contains(&port) {
@@ -544,13 +557,11 @@ impl Vm {
         #[cfg(target_arch = "x86_64")]
         let io_bus = Arc::clone(device_manager.lock().unwrap().io_bus());
         let mmio_bus = Arc::clone(device_manager.lock().unwrap().mmio_bus());
-        // Create the VmOps structure, which implements the VmmOps trait.
-        // And send it to the hypervisor.
 
         #[cfg(target_arch = "x86_64")]
         let pci_config_io =
             device_manager.lock().unwrap().pci_config_io() as Arc<Mutex<dyn BusDevice>>;
-        let vm_ops: Arc<dyn VmmOps> = Arc::new(VmOps {
+        let vm_ops: Arc<dyn VmOps> = Arc::new(VmOpsHandler {
             memory,
             #[cfg(target_arch = "x86_64")]
             io_bus,
@@ -1171,15 +1182,23 @@ impl Vm {
             .as_ref()
             .map(|(v, _)| *v);
 
-        let gic_device = create_gic(
-            &self.memory_manager.lock().as_ref().unwrap().vm,
-            self.cpu_manager.lock().unwrap().boot_vcpus() as u64,
-        )
-        .map_err(|e| {
-            Error::ConfigureSystem(arch::Error::PlatformSpecific(
-                arch::aarch64::Error::SetupGic(e),
-            ))
-        })?;
+        let vgic = self
+            .device_manager
+            .lock()
+            .unwrap()
+            .get_interrupt_controller()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .create_vgic(
+                &self.memory_manager.lock().as_ref().unwrap().vm,
+                self.cpu_manager.lock().unwrap().boot_vcpus() as u64,
+            )
+            .map_err(|_| {
+                Error::ConfigureSystem(arch::Error::PlatformSpecific(
+                    arch::aarch64::Error::SetupGic,
+                ))
+            })?;
 
         // PMU interrupt sticks to PPI, so need to be added by 16 to get real irq number.
         let pmu_supported = self
@@ -1202,21 +1221,11 @@ impl Vm {
             &initramfs_config,
             &pci_space_info,
             virtio_iommu_bdf.map(|bdf| bdf.into()),
-            &*gic_device,
+            &vgic,
             &self.numa_nodes,
             pmu_supported,
         )
         .map_err(Error::ConfigureSystem)?;
-
-        // Update the GIC entity in device manager
-        self.device_manager
-            .lock()
-            .unwrap()
-            .get_interrupt_controller()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .set_gic_device(Arc::new(Mutex::new(gic_device)));
 
         // Activate gic device
         self.device_manager
@@ -2207,7 +2216,16 @@ impl Vm {
         vm_snapshot: &mut Snapshot,
     ) -> std::result::Result<(), MigratableError> {
         let saved_vcpu_states = self.cpu_manager.lock().unwrap().get_saved_states();
-        let gic_device = Arc::clone(
+        self.device_manager
+            .lock()
+            .unwrap()
+            .get_interrupt_controller()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .set_gicr_typers(&saved_vcpu_states);
+
+        vm_snapshot.add_snapshot(
             self.device_manager
                 .lock()
                 .unwrap()
@@ -2215,28 +2233,7 @@ impl Vm {
                 .unwrap()
                 .lock()
                 .unwrap()
-                .get_gic_device()
-                .unwrap(),
-        );
-
-        gic_device
-            .lock()
-            .unwrap()
-            .set_gicr_typers(&saved_vcpu_states);
-
-        vm_snapshot.add_snapshot(
-            if let Some(gicv3_its) = gic_device
-                .lock()
-                .unwrap()
-                .as_any_concrete_mut()
-                .downcast_mut::<KvmGicV3Its>()
-            {
-                gicv3_its.snapshot()?
-            } else {
-                return Err(MigratableError::Snapshot(anyhow!(
-                    "GicDevice downcast to KvmGicV3Its failed when snapshotting VM!"
-                )));
-            },
+                .snapshot()?,
         );
 
         Ok(())
@@ -2255,7 +2252,14 @@ impl Vm {
         // Creating a GIC device here, as the GIC will not be created when
         // restoring the device manager. Note that currently only the bare GICv3
         // without ITS is supported.
-        let mut gic_device = create_gic(&self.vm, vcpu_numbers.try_into().unwrap())
+        self.device_manager
+            .lock()
+            .unwrap()
+            .get_interrupt_controller()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .create_vgic(&self.vm, vcpu_numbers.try_into().unwrap())
             .map_err(|e| MigratableError::Restore(anyhow!("Could not create GIC: {:#?}", e)))?;
 
         // PMU interrupt sticks to PPI, so need to be added by 16 to get real irq number.
@@ -2266,10 +2270,6 @@ impl Vm {
             .map_err(|e| MigratableError::Restore(anyhow!("Error init PMU: {:?}", e)))?;
 
         // Here we prepare the GICR_TYPER registers from the restored vCPU states.
-        gic_device.set_gicr_typers(&saved_vcpu_states);
-
-        let gic_device = Arc::new(Mutex::new(gic_device));
-        // Update the GIC entity in device manager
         self.device_manager
             .lock()
             .unwrap()
@@ -2277,22 +2277,18 @@ impl Vm {
             .unwrap()
             .lock()
             .unwrap()
-            .set_gic_device(Arc::clone(&gic_device));
+            .set_gicr_typers(&saved_vcpu_states);
 
         // Restore GIC states.
         if let Some(gicv3_its_snapshot) = vm_snapshot.snapshots.get(GIC_V3_ITS_SNAPSHOT_ID) {
-            if let Some(gicv3_its) = gic_device
+            self.device_manager
                 .lock()
                 .unwrap()
-                .as_any_concrete_mut()
-                .downcast_mut::<KvmGicV3Its>()
-            {
-                gicv3_its.restore(*gicv3_its_snapshot.clone())?;
-            } else {
-                return Err(MigratableError::Restore(anyhow!(
-                    "GicDevice downcast to KvmGicV3Its failed when restoring VM!"
-                )));
-            };
+                .get_interrupt_controller()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .restore(*gicv3_its_snapshot.clone())?;
         } else {
             return Err(MigratableError::Restore(anyhow!(
                 "Missing GicV3Its snapshot"
@@ -2528,6 +2524,54 @@ impl Vm {
         }
         Ok(GdbResponsePayload::CommandComplete)
     }
+
+    #[cfg(feature = "guest_debug")]
+    fn get_dump_state(
+        &mut self,
+        destination_url: &str,
+    ) -> std::result::Result<DumpState, GuestDebuggableError> {
+        let nr_cpus = self.config.lock().unwrap().cpus.boot_vcpus as u32;
+        let elf_note_size = self.get_note_size(NoteDescType::ElfAndVmmDesc, nr_cpus) as isize;
+        let mut elf_phdr_num = 1 as u16;
+        let elf_sh_info = 0;
+        let coredump_file_path = url_to_file(destination_url)?;
+        let mapping_num = self.memory_manager.lock().unwrap().num_guest_ram_mappings();
+
+        if mapping_num < UINT16_MAX - 2 {
+            elf_phdr_num += mapping_num as u16;
+        } else {
+            panic!("mapping num beyond 65535 not supported");
+        }
+        let coredump_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(coredump_file_path)
+            .map_err(|e| GuestDebuggableError::Coredump(e.into()))?;
+
+        let mem_offset = self.coredump_get_mem_offset(elf_phdr_num, elf_note_size);
+        let mem_data = self
+            .memory_manager
+            .lock()
+            .unwrap()
+            .coredump_memory_regions(mem_offset);
+
+        Ok(DumpState {
+            elf_note_size,
+            elf_phdr_num,
+            elf_sh_info,
+            mem_offset,
+            mem_info: Some(mem_data),
+            file: Some(coredump_file),
+        })
+    }
+
+    #[cfg(feature = "guest_debug")]
+    fn coredump_get_mem_offset(&self, phdr_num: u16, note_size: isize) -> u64 {
+        size_of::<elf::Elf64_Ehdr>() as u64
+            + note_size as u64
+            + size_of::<elf::Elf64_Phdr>() as u64 * phdr_num as u64
+    }
 }
 
 impl Pausable for Vm {
@@ -2605,7 +2649,7 @@ pub struct VmSnapshot {
     pub clock: Option<hypervisor::ClockData>,
     pub state: Option<hypervisor::VmState>,
     #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
-    pub common_cpuid: hypervisor::CpuId,
+    pub common_cpuid: hypervisor::x86_64::CpuId,
 }
 
 pub const VM_SNAPSHOT_ID: &str = "vm";
@@ -2709,17 +2753,6 @@ impl Snapshottable for Vm {
             )));
         }
 
-        if let Some(cpu_manager_snapshot) = snapshot.snapshots.get(CPU_MANAGER_SNAPSHOT_ID) {
-            self.cpu_manager
-                .lock()
-                .unwrap()
-                .restore(*cpu_manager_snapshot.clone())?;
-        } else {
-            return Err(MigratableError::Restore(anyhow!(
-                "Missing CPU manager snapshot"
-            )));
-        }
-
         if let Some(device_manager_snapshot) = snapshot.snapshots.get(DEVICE_MANAGER_SNAPSHOT_ID) {
             self.device_manager
                 .lock()
@@ -2728,6 +2761,17 @@ impl Snapshottable for Vm {
         } else {
             return Err(MigratableError::Restore(anyhow!(
                 "Missing device manager snapshot"
+            )));
+        }
+
+        if let Some(cpu_manager_snapshot) = snapshot.snapshots.get(CPU_MANAGER_SNAPSHOT_ID) {
+            self.cpu_manager
+                .lock()
+                .unwrap()
+                .restore(*cpu_manager_snapshot.clone())?;
+        } else {
+            return Err(MigratableError::Restore(anyhow!(
+                "Missing CPU manager snapshot"
             )));
         }
 
@@ -2953,6 +2997,55 @@ impl Debuggable for Vm {
             // The VM is not booted yet. Report boot_vcpus() instead.
             self.cpu_manager.lock().unwrap().boot_vcpus() as usize
         }
+    }
+}
+
+#[cfg(feature = "guest_debug")]
+pub const UINT16_MAX: u32 = 65535;
+
+#[cfg(feature = "guest_debug")]
+impl Elf64Writable for Vm {}
+
+#[cfg(feature = "guest_debug")]
+impl GuestDebuggable for Vm {
+    fn coredump(&mut self, destination_url: &str) -> std::result::Result<(), GuestDebuggableError> {
+        event!("vm", "coredumping");
+
+        #[cfg(feature = "tdx")]
+        {
+            if self.config.lock().unwrap().tdx.is_some() {
+                return Err(GuestDebuggableError::Coredump(anyhow!(
+                    "Coredump not possible with TDX VM"
+                )));
+            }
+        }
+
+        let current_state = self.get_state().unwrap();
+        if current_state != VmState::Paused {
+            return Err(GuestDebuggableError::Coredump(anyhow!(
+                "Trying to coredump while VM is running"
+            )));
+        }
+
+        let coredump_state = self.get_dump_state(destination_url)?;
+
+        self.write_header(&coredump_state)?;
+        self.write_note(&coredump_state)?;
+        self.write_loads(&coredump_state)?;
+
+        self.cpu_manager
+            .lock()
+            .unwrap()
+            .cpu_write_elf64_note(&coredump_state)?;
+        self.cpu_manager
+            .lock()
+            .unwrap()
+            .cpu_write_vmm_note(&coredump_state)?;
+
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .coredump_iterate_save_mem(&coredump_state)
     }
 }
 
@@ -3238,7 +3331,6 @@ mod tests {
     use super::*;
     use crate::GuestMemoryMmap;
     use arch::aarch64::fdt::create_fdt;
-    use arch::aarch64::gic::kvm::create_gic;
     use arch::aarch64::layout;
     use arch::{DeviceType, MmioDeviceInfo};
 
@@ -3281,14 +3373,23 @@ mod tests {
 
         let hv = hypervisor::new().unwrap();
         let vm = hv.create_vm().unwrap();
-        let gic = create_gic(&vm, 1).unwrap();
+        let gic = vm
+            .create_vgic(
+                1,
+                0x0900_0000 - 0x01_0000,
+                0x01_0000,
+                0x02_0000,
+                0x02_0000,
+                256,
+            )
+            .expect("Cannot create gic");
         assert!(create_fdt(
             &mem,
             "console=tty0",
             vec![0],
             Some((0, 0, 0)),
             &dev_info,
-            &*gic,
+            &gic,
             &None,
             &Vec::new(),
             &BTreeMap::new(),

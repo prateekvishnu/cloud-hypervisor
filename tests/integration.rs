@@ -75,11 +75,7 @@ const DIRECT_KERNEL_BOOT_CMDLINE: &str =
 
 const CONSOLE_TEST_STRING: &str = "Started OpenBSD Secure Shell server";
 
-fn prepare_virtiofsd(
-    tmp_dir: &TempDir,
-    shared_dir: &str,
-    cache: &str,
-) -> (std::process::Child, String) {
+fn prepare_virtiofsd(tmp_dir: &TempDir, shared_dir: &str) -> (std::process::Child, String) {
     let mut workload_path = dirs::home_dir().unwrap();
     workload_path.push("workloads");
 
@@ -94,7 +90,7 @@ fn prepare_virtiofsd(
     let child = Command::new(virtiofsd_path.as_str())
         .args(&["--shared-dir", shared_dir])
         .args(&["--socket-path", virtiofsd_socket_path.as_str()])
-        .args(&["--cache", cache])
+        .args(&["--cache", "never"])
         .spawn()
         .unwrap();
 
@@ -151,11 +147,20 @@ fn temp_api_path(tmp_dir: &TempDir) -> String {
     )
 }
 
+fn temp_event_monitor_path(tmp_dir: &TempDir) -> String {
+    String::from(tmp_dir.as_path().join("event.json").to_str().unwrap())
+}
+
 // Creates the directory and returns the path.
 fn temp_snapshot_dir_path(tmp_dir: &TempDir) -> String {
     let snapshot_dir = String::from(tmp_dir.as_path().join("snapshot").to_str().unwrap());
     std::fs::create_dir(&snapshot_dir).unwrap();
     snapshot_dir
+}
+
+fn temp_vmcore_file_path(tmp_dir: &TempDir) -> String {
+    let vmcore_file = String::from(tmp_dir.as_path().join("vmcore").to_str().unwrap());
+    vmcore_file
 }
 
 // Creates the path for direct kernel boot and return the path.
@@ -274,6 +279,7 @@ fn resize_command(
     desired_vcpus: Option<u8>,
     desired_ram: Option<usize>,
     desired_balloon: Option<usize>,
+    event_file: Option<&str>,
 ) -> bool {
     let mut cmd = Command::new(clh_command("ch-remote"));
     cmd.args(&[&format!("--api-socket={}", api_socket), "resize"]);
@@ -290,7 +296,23 @@ fn resize_command(
         cmd.arg(format!("--balloon={}", desired_balloon));
     }
 
-    cmd.status().expect("Failed to launch ch-remote").success()
+    let ret = cmd.status().expect("Failed to launch ch-remote").success();
+
+    if let Some(event_path) = event_file {
+        let latest_events = [
+            &MetaEvent {
+                event: "resizing".to_string(),
+                device_id: None,
+            },
+            &MetaEvent {
+                event: "resized".to_string(),
+                device_id: None,
+            },
+        ];
+        assert!(check_latest_events_exact(&latest_events, event_path));
+    }
+
+    ret
 }
 
 fn resize_zone_command(api_socket: &str, id: &str, desired_size: &str) -> bool {
@@ -460,6 +482,93 @@ fn fw_path(_fw_type: FwType) -> String {
     fw_path.to_str().unwrap().to_string()
 }
 
+struct MetaEvent {
+    event: String,
+    device_id: Option<String>,
+}
+
+impl MetaEvent {
+    pub fn match_with_json_event(&self, v: &serde_json::Value) -> bool {
+        let mut matched = false;
+        if v["event"].as_str().unwrap() == self.event {
+            if let Some(device_id) = &self.device_id {
+                if v["properties"]["id"].as_str().unwrap() == device_id {
+                    matched = true
+                }
+            } else {
+                matched = true;
+            }
+        }
+        matched
+    }
+}
+
+// Parse the event_monitor file based on the format that each event
+// is followed by a double newline
+fn parse_event_file(event_file: &str) -> Vec<serde_json::Value> {
+    let content = fs::read(event_file).unwrap();
+    let mut ret = Vec::new();
+    for entry in String::from_utf8_lossy(&content)
+        .trim()
+        .split("\n\n")
+        .collect::<Vec<&str>>()
+    {
+        ret.push(serde_json::from_str(entry).unwrap());
+    }
+
+    ret
+}
+
+// Return true if all events from the input 'expected_events' are matched sequentially
+// with events from the 'event_file'
+fn check_sequential_events(expected_events: &[&MetaEvent], event_file: &str) -> bool {
+    let json_events = parse_event_file(event_file);
+    let len = expected_events.len();
+    let mut idx = 0;
+    for e in &json_events {
+        if idx == len {
+            break;
+        }
+        if expected_events[idx].match_with_json_event(e) {
+            idx += 1;
+        }
+    }
+
+    idx == len
+}
+
+// Return true if all events from the input 'expected_events' are matched exactly
+// with events from the 'event_file'
+fn check_sequential_events_exact(expected_events: &[&MetaEvent], event_file: &str) -> bool {
+    let json_events = parse_event_file(event_file);
+    assert!(expected_events.len() <= json_events.len());
+    let json_events = &json_events[..expected_events.len()];
+
+    for (idx, e) in json_events.iter().enumerate() {
+        if !expected_events[idx].match_with_json_event(e) {
+            return false;
+        }
+    }
+
+    true
+}
+
+// Return true if events from the input 'expected_events' are matched exactly
+// with the most recent events from the 'event_file'
+fn check_latest_events_exact(latest_events: &[&MetaEvent], event_file: &str) -> bool {
+    let json_events = parse_event_file(event_file);
+    assert!(latest_events.len() <= json_events.len());
+    let json_events = &json_events[(json_events.len() - latest_events.len())..];
+
+    for (idx, e) in json_events.iter().enumerate() {
+        if !latest_events[idx].match_with_json_event(e) {
+            return false;
+        }
+    }
+
+    true
+}
+
 fn test_cpu_topology(threads_per_core: u8, cores_per_package: u8, packages: u8, use_fw: bool) {
     let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
     let guest = Guest::new(Box::new(focal));
@@ -591,7 +700,7 @@ fn _test_guest_numa_nodes(acpi: bool) {
             resize_zone_command(&api_socket, "mem2", "4G");
             // Resize to the maximum amount of CPUs and check each NUMA
             // node has been assigned the right CPUs set.
-            resize_command(&api_socket, Some(12), None, None);
+            resize_command(&api_socket, Some(12), None, None, None);
             thread::sleep(std::time::Duration::new(5, 0));
 
             guest.check_numa_common(
@@ -777,7 +886,7 @@ fn test_vhost_user_net(
 
             // Add RAM to the VM
             let desired_ram = 1024 << 20;
-            resize_command(&api_socket, None, Some(desired_ram), None);
+            resize_command(&api_socket, None, Some(desired_ram), None, None);
 
             thread::sleep(std::time::Duration::new(10, 0));
 
@@ -916,7 +1025,7 @@ fn test_vhost_user_blk(
 
             // Add RAM to the VM
             let desired_ram = 1024 << 20;
-            resize_command(&api_socket, None, Some(desired_ram), None);
+            resize_command(&api_socket, None, Some(desired_ram), None, None);
 
             thread::sleep(std::time::Duration::new(10, 0));
 
@@ -1018,11 +1127,8 @@ fn test_boot_from_vhost_user_blk(
     handle_child_output(r, &output);
 }
 
-fn test_virtio_fs(
-    dax: bool,
-    cache_size: Option<u64>,
-    virtiofsd_cache: &str,
-    prepare_daemon: &dyn Fn(&TempDir, &str, &str) -> (std::process::Child, String),
+fn _test_virtio_fs(
+    prepare_daemon: &dyn Fn(&TempDir, &str) -> (std::process::Child, String),
     hotplug: bool,
     pci_segment: Option<u16>,
 ) {
@@ -1053,18 +1159,8 @@ fn test_virtio_fs(
         direct_kernel_boot_path()
     };
 
-    let (dax_vmm_param, dax_mount_param) = if dax { ("on", "-o dax") } else { ("off", "") };
-    let cache_size_vmm_param = if let Some(cache) = cache_size {
-        format!(",cache_size={}", cache)
-    } else {
-        "".to_string()
-    };
-
-    let (mut daemon_child, virtiofsd_socket_path) = prepare_daemon(
-        &guest.tmp_dir,
-        shared_dir.to_str().unwrap(),
-        virtiofsd_cache,
-    );
+    let (mut daemon_child, virtiofsd_socket_path) =
+        prepare_daemon(&guest.tmp_dir, shared_dir.to_str().unwrap());
 
     let mut guest_command = GuestCommand::new(&guest);
     guest_command
@@ -1080,10 +1176,8 @@ fn test_virtio_fs(
     }
 
     let fs_params = format!(
-        "id=myfs0,tag=myfs,socket={},num_queues=1,queue_size=1024,dax={}{}{}",
+        "id=myfs0,tag=myfs,socket={},num_queues=1,queue_size=1024{}",
         virtiofsd_socket_path,
-        dax_vmm_param,
-        cache_size_vmm_param,
         if let Some(pci_segment) = pci_segment {
             format!(",pci_segment={}", pci_segment)
         } else {
@@ -1120,16 +1214,9 @@ fn test_virtio_fs(
         }
 
         // Mount shared directory through virtio_fs filesystem
-        let mount_cmd = format!(
-            "mkdir -p mount_dir && \
-                 sudo mount -t virtiofs {} myfs mount_dir/",
-            dax_mount_param
-        );
-        guest.ssh_command(&mount_cmd).unwrap();
-
-        assert!(guest
-            .valid_virtio_fs_cache_size(dax, cache_size)
-            .unwrap_or_default());
+        guest
+            .ssh_command("mkdir -p mount_dir && sudo mount -t virtiofs myfs mount_dir/")
+            .unwrap();
 
         // Check file1 exists and its content is "foo"
         assert_eq!(
@@ -1154,7 +1241,7 @@ fn test_virtio_fs(
 
             // Add RAM to the VM
             let desired_ram = 1024 << 20;
-            resize_command(&api_socket, None, Some(desired_ram), None);
+            resize_command(&api_socket, None, Some(desired_ram), None, None);
 
             thread::sleep(std::time::Duration::new(30, 0));
             assert!(guest.get_total_memory().unwrap_or_default() > 960_000);
@@ -1176,19 +1263,14 @@ fn test_virtio_fs(
 
     let (r, hotplug_daemon_child) = if r.is_ok() && hotplug {
         thread::sleep(std::time::Duration::new(10, 0));
-        let (daemon_child, virtiofsd_socket_path) = prepare_daemon(
-            &guest.tmp_dir,
-            shared_dir.to_str().unwrap(),
-            virtiofsd_cache,
-        );
+        let (daemon_child, virtiofsd_socket_path) =
+            prepare_daemon(&guest.tmp_dir, shared_dir.to_str().unwrap());
 
         let r = std::panic::catch_unwind(|| {
             thread::sleep(std::time::Duration::new(10, 0));
             let fs_params = format!(
-                "id=myfs0,tag=myfs,socket={},num_queues=1,queue_size=1024,dax={}{}{}",
+                "id=myfs0,tag=myfs,socket={},num_queues=1,queue_size=1024{}",
                 virtiofsd_socket_path,
-                dax_vmm_param,
-                cache_size_vmm_param,
                 if let Some(pci_segment) = pci_segment {
                     format!(",pci_segment={}", pci_segment)
                 } else {
@@ -1212,12 +1294,10 @@ fn test_virtio_fs(
 
             thread::sleep(std::time::Duration::new(10, 0));
             // Mount shared directory through virtio_fs filesystem
-            let mount_cmd = format!(
-                "mkdir -p mount_dir && \
-                     sudo mount -t virtiofs {} myfs mount_dir/",
-                dax_mount_param
-            );
-            guest.ssh_command(&mount_cmd).unwrap();
+            guest
+                .ssh_command("mkdir -p mount_dir && sudo mount -t virtiofs myfs mount_dir/")
+                .unwrap();
+
             // Check file1 exists and its content is "foo"
             assert_eq!(
                 guest.ssh_command("cat mount_dir/file1").unwrap().trim(),
@@ -1900,6 +1980,7 @@ mod parallel {
     fn test_simple_launch(fw_path: String, disk_path: &str) {
         let disk_config = Box::new(UbuntuDiskConfig::new(disk_path.to_string()));
         let guest = Guest::new(disk_config);
+        let event_path = temp_event_monitor_path(&guest.tmp_dir);
 
         let mut child = GuestCommand::new(&guest)
             .args(&["--cpus", "boot=1"])
@@ -1908,6 +1989,7 @@ mod parallel {
             .default_disks()
             .default_net()
             .args(&["--serial", "tty", "--console", "off"])
+            .args(&["--event-monitor", format!("path={}", event_path).as_str()])
             .capture_output()
             .spawn()
             .unwrap();
@@ -1920,6 +2002,51 @@ mod parallel {
             assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
             assert!(guest.get_entropy().unwrap_or_default() >= 900);
             assert_eq!(guest.get_pci_bridge_class().unwrap_or_default(), "0x060000");
+
+            let expected_sequential_events = [
+                &MetaEvent {
+                    event: "starting".to_string(),
+                    device_id: None,
+                },
+                &MetaEvent {
+                    event: "booting".to_string(),
+                    device_id: None,
+                },
+                &MetaEvent {
+                    event: "booted".to_string(),
+                    device_id: None,
+                },
+                &MetaEvent {
+                    event: "activated".to_string(),
+                    device_id: Some("_disk0".to_string()),
+                },
+                &MetaEvent {
+                    event: "reset".to_string(),
+                    device_id: Some("_disk0".to_string()),
+                },
+            ];
+            assert!(check_sequential_events(
+                &expected_sequential_events,
+                &event_path
+            ));
+
+            guest.ssh_command("sudo poweroff").unwrap();
+            thread::sleep(std::time::Duration::new(5, 0));
+            let latest_events = [
+                &MetaEvent {
+                    event: "shutdown".to_string(),
+                    device_id: None,
+                },
+                &MetaEvent {
+                    event: "deleted".to_string(),
+                    device_id: None,
+                },
+                &MetaEvent {
+                    event: "shutdown".to_string(),
+                    device_id: None,
+                },
+            ];
+            assert!(check_latest_events_exact(&latest_events, &event_path));
         });
 
         let _ = child.kill();
@@ -2964,25 +3091,25 @@ mod parallel {
     }
 
     #[test]
-    fn test_virtio_fs_dax_off() {
-        test_virtio_fs(false, None, "never", &prepare_virtiofsd, false, None)
+    fn test_virtio_fs() {
+        _test_virtio_fs(&prepare_virtiofsd, false, None)
     }
 
     #[test]
-    fn test_virtio_fs_hotplug_dax_off() {
-        test_virtio_fs(false, None, "never", &prepare_virtiofsd, true, None)
+    fn test_virtio_fs_hotplug() {
+        _test_virtio_fs(&prepare_virtiofsd, true, None)
     }
 
     #[test]
     #[cfg(not(feature = "mshv"))]
     fn test_virtio_fs_multi_segment_hotplug() {
-        test_virtio_fs(false, None, "never", &prepare_virtiofsd, true, Some(15))
+        _test_virtio_fs(&prepare_virtiofsd, true, Some(15))
     }
 
     #[test]
     #[cfg(not(feature = "mshv"))]
     fn test_virtio_fs_multi_segment() {
-        test_virtio_fs(false, None, "never", &prepare_virtiofsd, false, Some(15))
+        _test_virtio_fs(&prepare_virtiofsd, false, Some(15))
     }
 
     #[test]
@@ -4171,7 +4298,7 @@ mod parallel {
 
             // Resize the VM
             let desired_vcpus = 4;
-            resize_command(&api_socket, Some(desired_vcpus), None, None);
+            resize_command(&api_socket, Some(desired_vcpus), None, None, None);
 
             guest
                 .ssh_command("echo 1 | sudo tee /sys/bus/cpu/devices/cpu2/online")
@@ -4194,7 +4321,7 @@ mod parallel {
 
             // Resize the VM
             let desired_vcpus = 2;
-            resize_command(&api_socket, Some(desired_vcpus), None, None);
+            resize_command(&api_socket, Some(desired_vcpus), None, None, None);
 
             thread::sleep(std::time::Duration::new(10, 0));
             assert_eq!(
@@ -4204,7 +4331,7 @@ mod parallel {
 
             // Resize the VM back up to 4
             let desired_vcpus = 4;
-            resize_command(&api_socket, Some(desired_vcpus), None, None);
+            resize_command(&api_socket, Some(desired_vcpus), None, None, None);
 
             guest
                 .ssh_command("echo 1 | sudo tee /sys/bus/cpu/devices/cpu2/online")
@@ -4262,14 +4389,14 @@ mod parallel {
 
             // Add RAM to the VM
             let desired_ram = 1024 << 20;
-            resize_command(&api_socket, None, Some(desired_ram), None);
+            resize_command(&api_socket, None, Some(desired_ram), None, None);
 
             thread::sleep(std::time::Duration::new(10, 0));
             assert!(guest.get_total_memory().unwrap_or_default() > 960_000);
 
             // Use balloon to remove RAM from the VM
             let desired_balloon = 512 << 20;
-            resize_command(&api_socket, None, None, Some(desired_balloon));
+            resize_command(&api_socket, None, None, Some(desired_balloon), None);
 
             thread::sleep(std::time::Duration::new(10, 0));
             assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
@@ -4281,7 +4408,7 @@ mod parallel {
 
             // Use balloon add RAM to the VM
             let desired_balloon = 0;
-            resize_command(&api_socket, None, None, Some(desired_balloon));
+            resize_command(&api_socket, None, None, Some(desired_balloon), None);
 
             thread::sleep(std::time::Duration::new(10, 0));
 
@@ -4291,14 +4418,14 @@ mod parallel {
 
             // Add RAM to the VM
             let desired_ram = 2048 << 20;
-            resize_command(&api_socket, None, Some(desired_ram), None);
+            resize_command(&api_socket, None, Some(desired_ram), None, None);
 
             thread::sleep(std::time::Duration::new(10, 0));
             assert!(guest.get_total_memory().unwrap_or_default() > 1_920_000);
 
             // Remove RAM to the VM (only applies after reboot)
             let desired_ram = 1024 << 20;
-            resize_command(&api_socket, None, Some(desired_ram), None);
+            resize_command(&api_socket, None, Some(desired_ram), None, None);
 
             guest.reboot_linux(1, None);
 
@@ -4345,21 +4472,21 @@ mod parallel {
 
             // Add RAM to the VM
             let desired_ram = 1024 << 20;
-            resize_command(&api_socket, None, Some(desired_ram), None);
+            resize_command(&api_socket, None, Some(desired_ram), None, None);
 
             thread::sleep(std::time::Duration::new(10, 0));
             assert!(guest.get_total_memory().unwrap_or_default() > 960_000);
 
             // Add RAM to the VM
             let desired_ram = 2048 << 20;
-            resize_command(&api_socket, None, Some(desired_ram), None);
+            resize_command(&api_socket, None, Some(desired_ram), None, None);
 
             thread::sleep(std::time::Duration::new(10, 0));
             assert!(guest.get_total_memory().unwrap_or_default() > 1_920_000);
 
             // Remove RAM from the VM
             let desired_ram = 1024 << 20;
-            resize_command(&api_socket, None, Some(desired_ram), None);
+            resize_command(&api_socket, None, Some(desired_ram), None, None);
 
             thread::sleep(std::time::Duration::new(10, 0));
             assert!(guest.get_total_memory().unwrap_or_default() > 960_000);
@@ -4373,7 +4500,7 @@ mod parallel {
 
             // Check we can still resize to 512MiB
             let desired_ram = 512 << 20;
-            resize_command(&api_socket, None, Some(desired_ram), None);
+            resize_command(&api_socket, None, Some(desired_ram), None, None);
             thread::sleep(std::time::Duration::new(10, 0));
             assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
             assert!(guest.get_total_memory().unwrap_or_default() < 960_000);
@@ -4419,7 +4546,13 @@ mod parallel {
             // Resize the VM
             let desired_vcpus = 4;
             let desired_ram = 1024 << 20;
-            resize_command(&api_socket, Some(desired_vcpus), Some(desired_ram), None);
+            resize_command(
+                &api_socket,
+                Some(desired_vcpus),
+                Some(desired_ram),
+                None,
+                None,
+            );
 
             guest
                 .ssh_command("echo 1 | sudo tee /sys/bus/cpu/devices/cpu2/online")
@@ -5225,9 +5358,11 @@ mod parallel {
         );
 
         let socket = temp_vsock_path(&guest.tmp_dir);
+        let event_path = temp_event_monitor_path(&guest.tmp_dir);
 
         let mut child = GuestCommand::new(&guest)
             .args(&["--api-socket", &api_socket_source])
+            .args(&["--event-monitor", format!("path={}", event_path).as_str()])
             .args(&["--cpus", "boot=4"])
             .args(&[
                 "--memory",
@@ -5263,11 +5398,23 @@ mod parallel {
             // Check the guest RAM
             assert!(guest.get_total_memory().unwrap_or_default() > 3_840_000);
             // Increase guest RAM with virtio-mem
-            resize_command(&api_socket_source, None, Some(6 << 30), None);
+            resize_command(
+                &api_socket_source,
+                None,
+                Some(6 << 30),
+                None,
+                Some(&event_path),
+            );
             thread::sleep(std::time::Duration::new(5, 0));
             assert!(guest.get_total_memory().unwrap_or_default() > 5_760_000);
             // Use balloon to remove RAM from the VM
-            resize_command(&api_socket_source, None, None, Some(1 << 30));
+            resize_command(
+                &api_socket_source,
+                None,
+                None,
+                Some(1 << 30),
+                Some(&event_path),
+            );
             thread::sleep(std::time::Duration::new(5, 0));
             let total_memory = guest.get_total_memory().unwrap_or_default();
             assert!(total_memory > 4_800_000);
@@ -5290,6 +5437,11 @@ mod parallel {
                     Some(net_id),
                 ));
                 thread::sleep(std::time::Duration::new(10, 0));
+                let latest_events = [&MetaEvent {
+                    event: "device-removed".to_string(),
+                    device_id: Some(net_id.to_string()),
+                }];
+                assert!(check_latest_events_exact(&latest_events, &event_path));
 
                 // Plug the virtio-net device again
                 assert!(remote_command(
@@ -5302,6 +5454,17 @@ mod parallel {
 
             // Pause the VM
             assert!(remote_command(&api_socket_source, "pause", None));
+            let latest_events = [
+                &MetaEvent {
+                    event: "pausing".to_string(),
+                    device_id: None,
+                },
+                &MetaEvent {
+                    event: "paused".to_string(),
+                    device_id: None,
+                },
+            ];
+            assert!(check_latest_events_exact(&latest_events, &event_path));
 
             // Take a snapshot from the VM
             assert!(remote_command(
@@ -5312,6 +5475,18 @@ mod parallel {
 
             // Wait to make sure the snapshot is completed
             thread::sleep(std::time::Duration::new(10, 0));
+
+            let latest_events = [
+                &MetaEvent {
+                    event: "snapshotting".to_string(),
+                    device_id: None,
+                },
+                &MetaEvent {
+                    event: "snapshotted".to_string(),
+                    device_id: None,
+                },
+            ];
+            assert!(check_latest_events_exact(&latest_events, &event_path));
         });
 
         // Shutdown the source VM and check console output
@@ -5333,10 +5508,15 @@ mod parallel {
             .unwrap();
 
         let api_socket_restored = format!("{}.2", temp_api_path(&guest.tmp_dir));
+        let event_path_restored = format!("{}.2", temp_event_monitor_path(&guest.tmp_dir));
 
         // Restore the VM from the snapshot
         let mut child = GuestCommand::new(&guest)
             .args(&["--api-socket", &api_socket_restored])
+            .args(&[
+                "--event-monitor",
+                format!("path={}", event_path_restored).as_str(),
+            ])
             .args(&[
                 "--restore",
                 format!("source_url=file://{}", snapshot_dir).as_str(),
@@ -5347,10 +5527,46 @@ mod parallel {
 
         // Wait for the VM to be restored
         thread::sleep(std::time::Duration::new(10, 0));
+        let expected_events = [
+            &MetaEvent {
+                event: "starting".to_string(),
+                device_id: None,
+            },
+            &MetaEvent {
+                event: "restoring".to_string(),
+                device_id: None,
+            },
+        ];
+        assert!(check_sequential_events_exact(
+            &expected_events,
+            &event_path_restored
+        ));
+        let latest_events = [&MetaEvent {
+            event: "restored".to_string(),
+            device_id: None,
+        }];
+        assert!(check_latest_events_exact(
+            &latest_events,
+            &event_path_restored
+        ));
 
         let r = std::panic::catch_unwind(|| {
             // Resume the VM
             assert!(remote_command(&api_socket_restored, "resume", None));
+            let latest_events = [
+                &MetaEvent {
+                    event: "resuming".to_string(),
+                    device_id: None,
+                },
+                &MetaEvent {
+                    event: "resumed".to_string(),
+                    device_id: None,
+                },
+            ];
+            assert!(check_latest_events_exact(
+                &latest_events,
+                &event_path_restored
+            ));
 
             // Perform same checks to validate VM has been properly restored
             assert_eq!(guest.get_cpu_count().unwrap_or_default(), 4);
@@ -5358,11 +5574,11 @@ mod parallel {
             assert!(total_memory > 4_800_000);
             assert!(total_memory < 5_760_000);
             // Deflate balloon to restore entire RAM to the VM
-            resize_command(&api_socket_restored, None, None, Some(0));
+            resize_command(&api_socket_restored, None, None, Some(0), None);
             thread::sleep(std::time::Duration::new(5, 0));
             assert!(guest.get_total_memory().unwrap_or_default() > 5_760_000);
             // Decrease guest RAM with virtio-mem
-            resize_command(&api_socket_restored, None, Some(5 << 30), None);
+            resize_command(&api_socket_restored, None, Some(5 << 30), None, None);
             thread::sleep(std::time::Duration::new(5, 0));
             let total_memory = guest.get_total_memory().unwrap_or_default();
             assert!(total_memory > 4_800_000);
@@ -5412,6 +5628,56 @@ mod parallel {
 
             // Check that all the counters have increased
             assert!(new_counters > orig_counters);
+        });
+
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+
+        handle_child_output(r, &output);
+    }
+
+    #[test]
+    #[cfg(feature = "guest_debug")]
+    fn test_coredump() {
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+        let api_socket = temp_api_path(&guest.tmp_dir);
+
+        let mut cmd = GuestCommand::new(&guest);
+        cmd.args(&["--cpus", "boot=4"])
+            .args(&["--memory", "size=4G"])
+            .args(&["--kernel", fw_path(FwType::RustHypervisorFirmware).as_str()])
+            .default_disks()
+            .args(&["--net", guest.default_net_string().as_str()])
+            .args(&["--api-socket", &api_socket])
+            .capture_output();
+
+        let mut child = cmd.spawn().unwrap();
+        let vmcore_file = temp_vmcore_file_path(&guest.tmp_dir);
+
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot(None).unwrap();
+
+            assert!(remote_command(&api_socket, "pause", None));
+
+            assert!(remote_command(
+                &api_socket,
+                "coredump",
+                Some(format!("file://{}", vmcore_file).as_str()),
+            ));
+
+            // the num of CORE notes should equals to vcpu
+            let readelf_core_num_cmd = format!(
+                "readelf --all {} |grep CORE |grep -v Type |wc -l",
+                vmcore_file
+            );
+            let core_num_in_elf = exec_host_command_output(&readelf_core_num_cmd);
+            assert_eq!(String::from_utf8_lossy(&core_num_in_elf.stdout).trim(), "4");
+
+            // the num of QEMU notes should equals to vcpu
+            let readelf_vmm_num_cmd = format!("readelf --all {} |grep QEMU |wc -l", vmcore_file);
+            let vmm_num_in_elf = exec_host_command_output(&readelf_vmm_num_cmd);
+            assert_eq!(String::from_utf8_lossy(&vmm_num_in_elf.stdout).trim(), "4");
         });
 
         let _ = child.kill();
@@ -6291,7 +6557,7 @@ mod windows {
                 .spawn()
                 .unwrap();
             let stdin = child.stdin.as_mut().expect("failed to open stdin");
-            let _ = stdin
+            stdin
                 .write_all("type=7".as_bytes())
                 .expect("failed to write stdin");
             let out = child.wait_with_output().expect("sfdisk failed").stdout;
@@ -6677,7 +6943,7 @@ mod windows {
 
             let vcpu_num = 6;
             // Hotplug some CPUs
-            resize_command(&api_socket, Some(vcpu_num), None, None);
+            resize_command(&api_socket, Some(vcpu_num), None, None, None);
             // Wait to make sure CPUs are added
             thread::sleep(std::time::Duration::new(10, 0));
             // Check the guest sees the correct number
@@ -6687,7 +6953,7 @@ mod windows {
 
             let vcpu_num = 4;
             // Remove some CPUs. Note that Windows doesn't support hot-remove.
-            resize_command(&api_socket, Some(vcpu_num), None, None);
+            resize_command(&api_socket, Some(vcpu_num), None, None, None);
             // Wait to make sure CPUs are removed
             thread::sleep(std::time::Duration::new(10, 0));
             // Reboot to let Windows catch up
@@ -6755,7 +7021,7 @@ mod windows {
 
             let ram_size = 4 * 1024 * 1024 * 1024;
             // Hotplug some RAM
-            resize_command(&api_socket, None, Some(ram_size), None);
+            resize_command(&api_socket, None, Some(ram_size), None, None);
             // Wait to make sure RAM has been added
             thread::sleep(std::time::Duration::new(10, 0));
             // Check the guest sees the correct number
@@ -6763,7 +7029,7 @@ mod windows {
 
             let ram_size = 3 * 1024 * 1024 * 1024;
             // Unplug some RAM. Note that hot-remove most likely won't work.
-            resize_command(&api_socket, None, Some(ram_size), None);
+            resize_command(&api_socket, None, Some(ram_size), None, None);
             // Wait to make sure RAM has been added
             thread::sleep(std::time::Duration::new(10, 0));
             // Reboot to let Windows catch up
@@ -7233,7 +7499,7 @@ mod vfio {
 
             // Add RAM to the VM
             let desired_ram = 6 << 30;
-            resize_command(&api_socket, None, Some(desired_ram), None);
+            resize_command(&api_socket, None, Some(desired_ram), None, None);
             thread::sleep(std::time::Duration::new(30, 0));
             assert!(guest.get_total_memory().unwrap_or_default() > 5_760_000);
 
@@ -7375,9 +7641,9 @@ mod live_migration {
                 "--memory",
                 "size=0,hotplug_method=virtio-mem",
                 "--memory-zone",
-                "id=mem0,size=1G,hotplug_size=32G",
-                "id=mem1,size=1G,hotplug_size=32G",
-                "id=mem2,size=2G,hotplug_size=32G",
+                "id=mem0,size=1G,hotplug_size=4G",
+                "id=mem1,size=1G,hotplug_size=4G",
+                "id=mem2,size=2G,hotplug_size=4G",
                 "--numa",
                 "guest_numa_id=0,cpus=[0-2,9],distances=[1@15,2@20],memory_zones=mem0",
                 "guest_numa_id=1,cpus=[3-4,6-8],distances=[0@20,2@25],memory_zones=mem1",
@@ -7388,9 +7654,9 @@ mod live_migration {
                 "--memory",
                 "size=0,hotplug_method=virtio-mem,shared=on",
                 "--memory-zone",
-                "id=mem0,size=1G,hotplug_size=32G,shared=on",
-                "id=mem1,size=1G,hotplug_size=32G,shared=on",
-                "id=mem2,size=2G,hotplug_size=32G,shared=on",
+                "id=mem0,size=1G,hotplug_size=4G,shared=on",
+                "id=mem1,size=1G,hotplug_size=4G,shared=on",
+                "id=mem2,size=2G,hotplug_size=4G,shared=on",
                 "--numa",
                 "guest_numa_id=0,cpus=[0-2,9],distances=[1@15,2@20],memory_zones=mem0",
                 "guest_numa_id=1,cpus=[3-4,6-8],distances=[0@20,2@25],memory_zones=mem1",
@@ -7453,7 +7719,7 @@ mod live_migration {
             .unwrap();
 
         let r = std::panic::catch_unwind(|| {
-            guest.wait_vm_boot(Some(30)).unwrap();
+            guest.wait_vm_boot(None).unwrap();
 
             // Make sure the source VM is functaionl
             // Check the number of vCPUs
@@ -7463,11 +7729,11 @@ mod live_migration {
             if balloon {
                 assert!(guest.get_total_memory().unwrap_or_default() > 3_840_000);
                 // Increase the guest RAM
-                resize_command(&src_api_socket, None, Some(6 << 30), None);
+                resize_command(&src_api_socket, None, Some(6 << 30), None, None);
                 thread::sleep(std::time::Duration::new(5, 0));
                 assert!(guest.get_total_memory().unwrap_or_default() > 5_760_000);
                 // Use balloon to remove RAM from the VM
-                resize_command(&src_api_socket, None, None, Some(1 << 30));
+                resize_command(&src_api_socket, None, None, Some(1 << 30), None);
                 thread::sleep(std::time::Duration::new(5, 0));
                 let total_memory = guest.get_total_memory().unwrap_or_default();
                 assert!(total_memory > 4_800_000);
@@ -7704,7 +7970,7 @@ mod live_migration {
                     resize_zone_command(&dest_api_socket, "mem2", "4G");
                     // Resize to the maximum amount of CPUs and check each NUMA
                     // node has been assigned the right CPUs set.
-                    resize_command(&dest_api_socket, Some(12), None, None);
+                    resize_command(&dest_api_socket, Some(12), None, None, None);
                     thread::sleep(std::time::Duration::new(5, 0));
 
                     guest.check_numa_common(
@@ -7730,11 +7996,11 @@ mod live_migration {
                 assert!(total_memory > 4_800_000);
                 assert!(total_memory < 5_760_000);
                 // Deflate balloon to restore entire RAM to the VM
-                resize_command(&dest_api_socket, None, None, Some(0));
+                resize_command(&dest_api_socket, None, None, Some(0), None);
                 thread::sleep(std::time::Duration::new(5, 0));
                 assert!(guest.get_total_memory().unwrap_or_default() > 5_760_000);
                 // Decrease guest RAM with virtio-mem
-                resize_command(&dest_api_socket, None, Some(5 << 30), None);
+                resize_command(&dest_api_socket, None, Some(5 << 30), None, None);
                 thread::sleep(std::time::Duration::new(5, 0));
                 let total_memory = guest.get_total_memory().unwrap_or_default();
                 assert!(total_memory > 4_800_000);

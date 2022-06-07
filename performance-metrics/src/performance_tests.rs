@@ -238,6 +238,7 @@ pub fn performance_net_throughput(control: &PerformanceTestControl) -> f64 {
         .default_disks()
         .args(&["--net", net_params.as_str()])
         .capture_output()
+        .verbosity(VerbosityLevel::Warn)
         .set_print_cmd(false)
         .spawn()
         .unwrap();
@@ -367,6 +368,7 @@ pub fn performance_net_latency(control: &PerformanceTestControl) -> f64 {
         .default_disks()
         .args(&["--net", net_params.as_str()])
         .capture_output()
+        .verbosity(VerbosityLevel::Warn)
         .set_print_cmd(false)
         .spawn()
         .unwrap();
@@ -472,7 +474,12 @@ fn parse_boot_time_output(output: &[u8]) -> Result<f64, Error> {
 }
 
 fn measure_boot_time(cmd: &mut GuestCommand, test_timeout: u32) -> Result<f64, Error> {
-    let mut child = cmd.capture_output().set_print_cmd(false).spawn().unwrap();
+    let mut child = cmd
+        .capture_output()
+        .verbosity(VerbosityLevel::Warn)
+        .set_print_cmd(false)
+        .spawn()
+        .unwrap();
 
     thread::sleep(Duration::new(test_timeout as u64, 0));
     let _ = child.kill();
@@ -499,6 +506,10 @@ pub fn performance_boot_time(control: &PerformanceTestControl) -> f64 {
         let mut cmd = GuestCommand::new(&guest);
 
         let c = cmd
+            .args(&[
+                "--cpus",
+                &format!("boot={}", control.num_boot_vcpus.unwrap_or(1)),
+            ])
             .args(&["--memory", "size=1G"])
             .args(&["--kernel", direct_kernel_boot_path().to_str().unwrap()])
             .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
@@ -522,6 +533,10 @@ pub fn performance_boot_time_pmem(control: &PerformanceTestControl) -> f64 {
         let guest = performance_test_new_guest(Box::new(focal));
         let mut cmd = GuestCommand::new(&guest);
         let c = cmd
+            .args(&[
+                "--cpus",
+                &format!("boot={}", control.num_boot_vcpus.unwrap_or(1)),
+            ])
             .args(&["--memory", "size=1G,hugepages=on"])
             .args(&["--kernel", direct_kernel_boot_path().to_str().unwrap()])
             .args(&["--cmdline", "root=/dev/pmem0p1 console=ttyS0 quiet rw"])
@@ -655,6 +670,7 @@ pub fn performance_block_io(control: &PerformanceTestControl) -> f64 {
         .default_net()
         .args(&["--api-socket", &api_socket])
         .capture_output()
+        .verbosity(VerbosityLevel::Warn)
         .set_print_cmd(false)
         .spawn()
         .unwrap();
