@@ -23,6 +23,7 @@ use thiserror::Error;
 use vmm::config;
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::block_signal;
+use vmm_sys_util::terminal::Terminal;
 
 #[derive(Error, Debug)]
 enum Error {
@@ -31,14 +32,7 @@ enum Error {
     #[cfg(feature = "gdb")]
     #[error("Failed to create Debug EventFd: {0}")]
     CreateDebugEventFd(#[source] std::io::Error),
-    #[cfg_attr(
-        feature = "kvm",
-        error("Failed to open hypervisor interface (is /dev/kvm available?): {0}")
-    )]
-    #[cfg_attr(
-        feature = "mshv",
-        error("Failed to open hypervisor interface (is /dev/mshv available?): {0}")
-    )]
+    #[error("Failed to open hypervisor interface (is hypervisor interface available?): {0}")]
     CreateHypervisor(#[source] hypervisor::HypervisorError),
     #[error("Failed to start the VMM thread: {0}")]
     StartVmmThread(#[source] vmm::Error),
@@ -520,7 +514,13 @@ fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
     // Before we start any threads, mask the signals we'll be
     // installing handlers for, to make sure they only ever run on the
     // dedicated signal handling thread we'll start in a bit.
-    for sig in &vmm::vm::HANDLED_SIGNALS {
+    for sig in &vmm::vm::Vm::HANDLED_SIGNALS {
+        if let Err(e) = block_signal(*sig) {
+            eprintln!("Error blocking signals: {}", e);
+        }
+    }
+
+    for sig in &vmm::Vmm::HANDLED_SIGNALS {
         if let Err(e) = block_signal(*sig) {
             eprintln!("Error blocking signals: {}", e);
         }
@@ -622,6 +622,13 @@ fn main() {
             1
         }
     };
+
+    let on_tty = unsafe { libc::isatty(libc::STDIN_FILENO as i32) } != 0;
+    if on_tty {
+        // Don't forget to set the terminal in canonical mode
+        // before to exit.
+        std::io::stdin().lock().set_canon_mode().unwrap();
+    }
 
     std::process::exit(exit_code);
 }

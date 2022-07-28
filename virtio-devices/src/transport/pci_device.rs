@@ -292,8 +292,8 @@ pub struct VirtioPciDeviceActivator {
     memory: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
     device: Arc<Mutex<dyn VirtioDevice>>,
     device_activated: Arc<AtomicBool>,
-    queues: Option<Vec<Queue<GuestMemoryAtomic<GuestMemoryMmap>>>>,
-    queue_evts: Option<Vec<EventFd>>,
+    #[allow(clippy::type_complexity)]
+    queues: Option<Vec<(usize, Queue<GuestMemoryAtomic<GuestMemoryMmap>>, EventFd)>>,
     barrier: Option<Arc<Barrier>>,
     id: String,
 }
@@ -304,7 +304,6 @@ impl VirtioPciDeviceActivator {
             self.memory.take().unwrap(),
             self.interrupt.take().unwrap(),
             self.queues.take().unwrap(),
-            self.queue_evts.take().unwrap(),
         )?;
         self.device_activated.store(true, Ordering::SeqCst);
 
@@ -699,15 +698,22 @@ impl VirtioPciDevice {
     }
 
     fn prepare_activator(&mut self, barrier: Option<Arc<Barrier>>) -> VirtioPciDeviceActivator {
-        let mut queue_evts = Vec::new();
-        let mut queues: Vec<Queue<GuestMemoryAtomic<GuestMemoryMmap>>> =
-            self.queues.iter().map(vm_virtio::clone_queue).collect();
-        queues.retain(|q| q.state.ready);
-        for (i, queue) in queues.iter().enumerate() {
-            queue_evts.push(self.queue_evts[i].try_clone().unwrap());
-            if !queue.is_valid() {
-                error!("Queue {} is not valid", i);
+        let mut queues = Vec::new();
+
+        for (queue_index, queue) in self.queues.iter().enumerate() {
+            if !queue.state.ready {
+                continue;
             }
+
+            if !queue.is_valid() {
+                error!("Queue {} is not valid", queue_index);
+            }
+
+            queues.push((
+                queue_index,
+                vm_virtio::clone_queue(queue),
+                self.queue_evts[queue_index].try_clone().unwrap(),
+            ));
         }
 
         VirtioPciDeviceActivator {
@@ -716,12 +722,6 @@ impl VirtioPciDevice {
             device: self.device.clone(),
             queues: Some(queues),
             device_activated: self.device_activated.clone(),
-            queue_evts: Some(
-                queue_evts
-                    .iter()
-                    .map(|fd| fd.try_clone().unwrap())
-                    .collect(),
-            ),
             barrier,
             id: self.id.clone(),
         }
@@ -1052,7 +1052,7 @@ impl PciDevice for VirtioPciDevice {
                 self.device.clone(),
             ),
             o if (ISR_CONFIG_BAR_OFFSET..ISR_CONFIG_BAR_OFFSET + ISR_CONFIG_SIZE).contains(&o) => {
-                if let Some(v) = data.get(0) {
+                if let Some(v) = data.first() {
                     self.interrupt_status
                         .fetch_and(!(*v as usize), Ordering::AcqRel);
                 }

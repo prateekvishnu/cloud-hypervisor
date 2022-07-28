@@ -23,10 +23,10 @@ pipeline{
 						}
 					}
 				}
-				stage ('Check for fuzzer cargo files only changes') {
+				stage ('Check for fuzzer files only changes') {
 					when {
 						expression {
-							return fuzzCargoFileOnly()
+							return fuzzFileOnly()
 						}
 					}
 					steps {
@@ -56,7 +56,7 @@ pipeline{
 		stage ('Build') {
 			parallel {
 				stage ('Worker build') {
-					agent { node { label 'focal' } }
+					agent { node { label 'jammy' } }
 					when {
 						beforeAgent true
 						expression {
@@ -132,7 +132,7 @@ pipeline{
 					}
 				}
 				stage ('Worker build (musl)') {
-					agent { node { label 'focal' } }
+					agent { node { label 'jammy' } }
 					when {
 						beforeAgent true
 						expression {
@@ -166,8 +166,90 @@ pipeline{
 						}
 					}
 				}
+				stage ('Worker build SGX') {
+					agent { node { label 'bionic-sgx' } }
+					when {
+						beforeAgent true
+						allOf {
+							branch 'main'
+							expression {
+								return runWorkers
+							}
+						}
+					}
+					stages {
+						stage ('Checkout') {
+							steps {
+								checkout scm
+							}
+						}
+						stage ('Run SGX integration tests') {
+							options {
+								timeout(time: 1, unit: 'HOURS')
+							}
+							steps {
+								sh "scripts/dev_cli.sh tests --integration-sgx"
+							}
+						}
+						stage ('Run SGX integration tests for musl') {
+							options {
+								timeout(time: 1, unit: 'HOURS')
+							}
+							steps {
+								sh "scripts/dev_cli.sh tests --integration-sgx --libc musl"
+							}
+						}
+					}
+					post {
+						always {
+							sh "sudo chown -R jenkins.jenkins ${WORKSPACE}"
+							deleteDir()
+						}
+					}
+				}
+				stage ('Worker build VFIO') {
+					agent { node { label 'bionic-vfio' } }
+					when {
+						beforeAgent true
+						allOf {
+							branch 'main'
+							expression {
+								return runWorkers
+							}
+						}
+					}
+					stages {
+						stage ('Checkout') {
+							steps {
+								checkout scm
+							}
+						}
+						stage ('Run VFIO integration tests') {
+							options {
+								timeout(time: 1, unit: 'HOURS')
+							}
+							steps {
+								sh "scripts/dev_cli.sh tests --integration-vfio"
+							}
+						}
+						stage ('Run VFIO integration tests for musl') {
+							options {
+								timeout(time: 1, unit: 'HOURS')
+							}
+							steps {
+								sh "scripts/dev_cli.sh tests --integration-vfio --libc musl"
+							}
+						}
+					}
+					post {
+						always {
+							sh "sudo chown -R jenkins.jenkins ${WORKSPACE}"
+							deleteDir()
+						}
+					}
+				}
 				stage ('Worker build - Windows guest') {
-					agent { node { label 'focal' } }
+					agent { node { label 'jammy' } }
 					when {
 						beforeAgent true
 						expression {
@@ -213,7 +295,7 @@ pipeline{
 					}
 				}
 				stage ('Worker build - Live Migration') {
-					agent { node { label 'focal-small' } }
+					agent { node { label 'jammy-small' } }
 					when {
 						beforeAgent true
 						expression {
@@ -242,6 +324,39 @@ pipeline{
 							steps {
 								sh "sudo modprobe openvswitch"
 								sh "scripts/dev_cli.sh tests --integration-live-migration --libc musl"
+							}
+						}
+					}
+				}
+				stage ('Worker build - Metrics') {
+					agent { node { label 'focal-metrics' } }
+					when {
+						branch 'main'
+						beforeAgent true
+						expression {
+							return runWorkers
+						}
+					}
+					environment {
+						METRICS_PUBLISH_KEY = credentials('52e0945f-ce7a-43d1-87af-67d1d87cc40f')
+					}
+					stages {
+						stage ('Checkout') {
+							steps {
+								checkout scm
+							}
+						}
+						stage ('Run metrics tests') {
+							options {
+								timeout(time: 1, unit: 'HOURS')
+							}
+							steps {
+								sh 'scripts/dev_cli.sh tests --metrics -- -- --report-file /root/workloads/metrics.json'
+							}
+						}
+						stage ('Upload metrics report') {
+							steps {
+								sh 'curl -X PUT https://cloud-hypervisor-metrics.azurewebsites.net/api/publishmetrics -H "x-functions-key: $METRICS_PUBLISH_KEY" -T ~/workloads/metrics.json'
 							}
 						}
 					}
@@ -285,7 +400,7 @@ def cancelPreviousBuilds() {
 def installAzureCli() {
 	sh "sudo apt install -y ca-certificates curl apt-transport-https lsb-release gnupg"
 	sh "curl -sL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/microsoft.gpg > /dev/null"
-	sh "echo \"deb [arch=amd64] https://packages.microsoft.com/repos/azure-cli/ focal main\" | sudo tee /etc/apt/sources.list.d/azure-cli.list"
+	sh "echo \"deb [arch=amd64] https://packages.microsoft.com/repos/azure-cli/ jammy main\" | sudo tee /etc/apt/sources.list.d/azure-cli.list"
 	sh "sudo apt update"
 	sh "sudo apt install -y azure-cli"
 }
@@ -301,13 +416,13 @@ def boolean docsFileOnly() {
     ) != 0
 }
 
-def boolean fuzzCargoFileOnly() {
+def boolean fuzzFileOnly() {
     if (env.CHANGE_TARGET == null) {
         return false;
     }
 
     return sh(
         returnStatus: true,
-        script: "git diff --name-only origin/${env.CHANGE_TARGET}... | grep -v -E 'fuzz\\/Cargo.(toml|lock)'"
+        script: "git diff --name-only origin/${env.CHANGE_TARGET}... | grep -v -E 'fuzz/'"
     ) != 0
 }

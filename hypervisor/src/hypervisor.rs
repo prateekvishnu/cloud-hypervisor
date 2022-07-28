@@ -7,13 +7,12 @@
 // Copyright 2018-2019 CrowdStrike, Inc.
 //
 //
+#[cfg(target_arch = "x86_64")]
+use crate::arch::x86::CpuIdEntry;
 #[cfg(feature = "tdx")]
 use crate::kvm::TdxCapabilities;
 use crate::vm::Vm;
-#[cfg(target_arch = "x86_64")]
-use crate::x86_64::CpuId;
-#[cfg(target_arch = "x86_64")]
-use crate::x86_64::MsrList;
+use crate::HypervisorType;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -21,6 +20,11 @@ use thiserror::Error;
 ///
 ///
 pub enum HypervisorError {
+    ///
+    /// Hypervisor availability check error
+    ///
+    #[error("Failed to check availability of the hypervisor: {0}")]
+    HypervisorAvailableCheck(#[source] anyhow::Error),
     ///
     /// hypervisor creation error
     ///
@@ -66,6 +70,11 @@ pub enum HypervisorError {
     ///
     #[error("Failed to retrieve TDX capabilities:{0}")]
     TdxCapabilities(#[source] anyhow::Error),
+    ///
+    /// Failed to set partition property
+    ///
+    #[error("Failed to set partition property:{0}")]
+    SetPartitionProperty(#[source] anyhow::Error),
 }
 
 ///
@@ -79,6 +88,10 @@ pub type Result<T> = std::result::Result<T, HypervisorError>;
 /// This crate provides a hypervisor-agnostic interfaces
 ///
 pub trait Hypervisor: Send + Sync {
+    ///
+    /// Returns the type of the hypervisor
+    ///
+    fn hypervisor_type(&self) -> HypervisorType;
     ///
     /// Create a Vm using the underlying hypervisor
     /// Return a hypervisor-agnostic Vm trait object
@@ -95,18 +108,13 @@ pub trait Hypervisor: Send + Sync {
     ///
     /// Get the supported CpuID
     ///
-    fn get_cpuid(&self) -> Result<CpuId>;
+    fn get_cpuid(&self) -> Result<Vec<CpuIdEntry>>;
     ///
     /// Check particular extensions if any
     ///
     fn check_required_extensions(&self) -> Result<()> {
         Ok(())
     }
-    #[cfg(target_arch = "x86_64")]
-    ///
-    /// Retrieve the list of MSRs supported by the hypervisor.
-    ///
-    fn get_msr_list(&self) -> Result<MsrList>;
     #[cfg(target_arch = "aarch64")]
     ///
     /// Retrieve AArch64 host maximum IPA size supported by KVM.

@@ -333,7 +333,7 @@ impl Fs {
                     device_type: VirtioDeviceType::Fs as u32,
                     queue_sizes: vec![queue_size; num_queues],
                     paused_sync: Some(Arc::new(Barrier::new(2))),
-                    min_queues: DEFAULT_QUEUE_NUMBER as u16,
+                    min_queues: 1,
                     ..Default::default()
                 },
                 vu_common: VhostUserCommon {
@@ -413,7 +413,7 @@ impl Fs {
                 acked_features: acked_features & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits(),
                 queue_sizes: vec![queue_size; num_queues],
                 paused_sync: Some(Arc::new(Barrier::new(2))),
-                min_queues: DEFAULT_QUEUE_NUMBER as u16,
+                min_queues: 1,
                 ..Default::default()
             },
             vu_common: VhostUserCommon {
@@ -504,10 +504,9 @@ impl VirtioDevice for Fs {
         &mut self,
         mem: GuestMemoryAtomic<GuestMemoryMmap>,
         interrupt_cb: Arc<dyn VirtioInterrupt>,
-        queues: Vec<Queue<GuestMemoryAtomic<GuestMemoryMmap>>>,
-        queue_evts: Vec<EventFd>,
+        queues: Vec<(usize, Queue<GuestMemoryAtomic<GuestMemoryMmap>>, EventFd)>,
     ) -> ActivateResult {
-        self.common.activate(&queues, &queue_evts, &interrupt_cb)?;
+        self.common.activate(&queues, &interrupt_cb)?;
         self.guest_memory = Some(mem.clone());
 
         // Initialize slave communication.
@@ -547,7 +546,6 @@ impl VirtioDevice for Fs {
         let mut handler = self.vu_common.activate(
             mem,
             queues,
-            queue_evts,
             interrupt_cb,
             self.common.acked_features,
             slave_req_handler,
@@ -584,11 +582,7 @@ impl VirtioDevice for Fs {
         }
 
         if let Some(vu) = &self.vu_common.vu {
-            if let Err(e) = vu
-                .lock()
-                .unwrap()
-                .reset_vhost_user(self.common.queue_sizes.len())
-            {
+            if let Err(e) = vu.lock().unwrap().reset_vhost_user() {
                 error!("Failed to reset vhost-user daemon: {:?}", e);
                 return None;
             }

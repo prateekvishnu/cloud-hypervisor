@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+#![allow(clippy::significant_drop_in_scrutinee)]
+
 #[macro_use]
 extern crate event_monitor;
-#[macro_use]
-extern crate lazy_static;
 #[macro_use]
 extern crate log;
 
@@ -26,12 +26,13 @@ use crate::migration::{recv_vm_config, recv_vm_state};
 use crate::seccomp_filters::{get_seccomp_filter, Thread};
 use crate::vm::{Error as VmError, Vm, VmState};
 use anyhow::anyhow;
-use libc::EFD_NONBLOCK;
+use libc::{EFD_NONBLOCK, SIGINT, SIGTERM};
 use memory_manager::MemoryManagerSnapshotData;
 use pci::PciBdf;
 use seccompiler::{apply_filter, SeccompAction};
 use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
+use signal_hook::iterator::{Handle, Signals};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
@@ -39,6 +40,7 @@ use std::io::{Read, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvError, SendError, Sender};
 use std::sync::{Arc, Mutex};
@@ -48,7 +50,9 @@ use vm_memory::bitmap::AtomicBitmap;
 use vm_migration::{protocol::*, Migratable};
 use vm_migration::{MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vmm_sys_util::eventfd::EventFd;
+use vmm_sys_util::signal::unblock_signal;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
+use vmm_sys_util::terminal::Terminal;
 
 mod acpi;
 pub mod api;
@@ -163,10 +167,16 @@ pub enum Error {
     #[cfg(feature = "gdb")]
     #[error("Error sending GDB request: {0}")]
     GdbResponseSend(#[source] SendError<gdb::GdbResponse>),
+
+    #[error("Cannot spawn a signal handler thread: {0}")]
+    SignalHandlerSpawn(#[source] io::Error),
+
+    #[error("Failed to join on threads: {0:?}")]
+    ThreadCleanup(std::boxed::Box<dyn std::any::Any + std::marker::Send>),
 }
 pub type Result<T> = result::Result<T, Error>;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 pub enum EpollDispatch {
     Exit = 0,
@@ -270,10 +280,11 @@ pub fn start_vmm_thread(
     let gdb_vm_debug_event = vm_debug_event.try_clone().map_err(Error::EventFdClone)?;
 
     let http_api_event = api_event.try_clone().map_err(Error::EventFdClone)?;
+    let hypervisor_type = hypervisor.hypervisor_type();
 
     // Retrieve seccomp filter
-    let vmm_seccomp_filter =
-        get_seccomp_filter(seccomp_action, Thread::Vmm).map_err(Error::CreateSeccompFilter)?;
+    let vmm_seccomp_filter = get_seccomp_filter(seccomp_action, Thread::Vmm, hypervisor_type)
+        .map_err(Error::CreateSeccompFilter)?;
 
     let vmm_seccomp_action = seccomp_action.clone();
     let exit_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?;
@@ -299,6 +310,8 @@ pub fn start_vmm_thread(
                     exit_evt,
                 )?;
 
+                vmm.setup_signal_handler()?;
+
                 vmm.control_loop(
                     Arc::new(api_receiver),
                     #[cfg(feature = "gdb")]
@@ -316,6 +329,7 @@ pub fn start_vmm_thread(
             api_sender,
             seccomp_action,
             exit_evt,
+            hypervisor_type,
         )?;
     } else if let Some(http_fd) = http_fd {
         api::start_http_fd_thread(
@@ -324,6 +338,7 @@ pub fn start_vmm_thread(
             api_sender,
             seccomp_action,
             exit_evt,
+            hypervisor_type,
         )?;
     }
 
@@ -343,7 +358,7 @@ pub fn start_vmm_thread(
 struct VmMigrationConfig {
     vm_config: Arc<Mutex<VmConfig>>,
     #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
-    common_cpuid: hypervisor::x86_64::CpuId,
+    common_cpuid: Vec<hypervisor::arch::x86::CpuIdEntry>,
     memory_manager_data: MemoryManagerSnapshotData,
 }
 
@@ -362,9 +377,81 @@ pub struct Vmm {
     seccomp_action: SeccompAction,
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
     activate_evt: EventFd,
+    signals: Option<Handle>,
+    threads: Vec<thread::JoinHandle<()>>,
 }
 
 impl Vmm {
+    pub const HANDLED_SIGNALS: [i32; 2] = [SIGTERM, SIGINT];
+
+    fn signal_handler(mut signals: Signals, on_tty: bool, exit_evt: &EventFd) {
+        for sig in &Self::HANDLED_SIGNALS {
+            unblock_signal(*sig).unwrap();
+        }
+
+        for signal in signals.forever() {
+            match signal {
+                SIGTERM | SIGINT => {
+                    if exit_evt.write(1).is_err() {
+                        // Resetting the terminal is usually done as the VMM exits
+                        if on_tty {
+                            io::stdin()
+                                .lock()
+                                .set_canon_mode()
+                                .expect("failed to restore terminal mode");
+                        }
+                        std::process::exit(1);
+                    }
+                }
+                _ => (),
+            }
+        }
+    }
+
+    fn setup_signal_handler(&mut self) -> Result<()> {
+        let signals = Signals::new(&Self::HANDLED_SIGNALS);
+        match signals {
+            Ok(signals) => {
+                self.signals = Some(signals.handle());
+                let exit_evt = self.exit_evt.try_clone().map_err(Error::EventFdClone)?;
+                let on_tty = unsafe { libc::isatty(libc::STDIN_FILENO as i32) } != 0;
+
+                let signal_handler_seccomp_filter = get_seccomp_filter(
+                    &self.seccomp_action,
+                    Thread::SignalHandler,
+                    self.hypervisor.hypervisor_type(),
+                )
+                .map_err(Error::CreateSeccompFilter)?;
+                self.threads.push(
+                    thread::Builder::new()
+                        .name("vmm_signal_handler".to_string())
+                        .spawn(move || {
+                            if !signal_handler_seccomp_filter.is_empty() {
+                                if let Err(e) = apply_filter(&signal_handler_seccomp_filter)
+                                    .map_err(Error::ApplySeccompFilter)
+                                {
+                                    error!("Error applying seccomp filter: {:?}", e);
+                                    exit_evt.write(1).ok();
+                                    return;
+                                }
+                            }
+                            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                Vmm::signal_handler(signals, on_tty, &exit_evt);
+                            }))
+                            .map_err(|_| {
+                                error!("signal_handler thead panicked");
+                                exit_evt.write(1).ok()
+                            })
+                            .ok();
+                        })
+                        .map_err(Error::SignalHandlerSpawn)?,
+                );
+            }
+            Err(e) => error!("Signal not found {}", e),
+        }
+        Ok(())
+    }
+
     fn new(
         vmm_version: String,
         api_evt: EventFd,
@@ -414,6 +501,8 @@ impl Vmm {
             seccomp_action,
             hypervisor,
             activate_evt,
+            signals: None,
+            threads: vec![],
         })
     }
 
@@ -1510,7 +1599,7 @@ impl Vmm {
     fn vm_check_cpuid_compatibility(
         &self,
         src_vm_config: &Arc<Mutex<VmConfig>>,
-        src_vm_cpuid: &hypervisor::x86_64::CpuId,
+        src_vm_cpuid: &[hypervisor::arch::x86::CpuIdEntry],
     ) -> result::Result<(), MigratableError> {
         // We check the `CPUID` compatibility of between the source vm and destination, which is
         // mostly about feature compatibility and "topology/sgx" leaves are not relevant.
@@ -1602,257 +1691,269 @@ impl Vmm {
                         }
                     }
                     EpollDispatch::Api => {
-                        // Consume the event.
-                        self.api_evt.read().map_err(Error::EventFdRead)?;
+                        // Consume the events.
+                        for _ in 0..self.api_evt.read().map_err(Error::EventFdRead)? {
+                            // Read from the API receiver channel
+                            let api_request = api_receiver.recv().map_err(Error::ApiRequestRecv)?;
 
-                        // Read from the API receiver channel
-                        let api_request = api_receiver.recv().map_err(Error::ApiRequestRecv)?;
+                            info!("API request event: {:?}", api_request);
+                            match api_request {
+                                ApiRequest::VmCreate(config, sender) => {
+                                    let response = self
+                                        .vm_create(config)
+                                        .map_err(ApiError::VmCreate)
+                                        .map(|_| ApiResponsePayload::Empty);
 
-                        info!("API request event: {:?}", api_request);
-                        match api_request {
-                            ApiRequest::VmCreate(config, sender) => {
-                                let response = self
-                                    .vm_create(config)
-                                    .map_err(ApiError::VmCreate)
-                                    .map(|_| ApiResponsePayload::Empty);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmDelete(sender) => {
+                                    let response = self
+                                        .vm_delete()
+                                        .map_err(ApiError::VmDelete)
+                                        .map(|_| ApiResponsePayload::Empty);
 
-                                sender.send(response).map_err(Error::ApiResponseSend)?;
-                            }
-                            ApiRequest::VmDelete(sender) => {
-                                let response = self
-                                    .vm_delete()
-                                    .map_err(ApiError::VmDelete)
-                                    .map(|_| ApiResponsePayload::Empty);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmBoot(sender) => {
+                                    let response = self
+                                        .vm_boot()
+                                        .map_err(ApiError::VmBoot)
+                                        .map(|_| ApiResponsePayload::Empty);
 
-                                sender.send(response).map_err(Error::ApiResponseSend)?;
-                            }
-                            ApiRequest::VmBoot(sender) => {
-                                let response = self
-                                    .vm_boot()
-                                    .map_err(ApiError::VmBoot)
-                                    .map(|_| ApiResponsePayload::Empty);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmShutdown(sender) => {
+                                    let response = self
+                                        .vm_shutdown()
+                                        .map_err(ApiError::VmShutdown)
+                                        .map(|_| ApiResponsePayload::Empty);
 
-                                sender.send(response).map_err(Error::ApiResponseSend)?;
-                            }
-                            ApiRequest::VmShutdown(sender) => {
-                                let response = self
-                                    .vm_shutdown()
-                                    .map_err(ApiError::VmShutdown)
-                                    .map(|_| ApiResponsePayload::Empty);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmReboot(sender) => {
+                                    let response = self
+                                        .vm_reboot()
+                                        .map_err(ApiError::VmReboot)
+                                        .map(|_| ApiResponsePayload::Empty);
 
-                                sender.send(response).map_err(Error::ApiResponseSend)?;
-                            }
-                            ApiRequest::VmReboot(sender) => {
-                                let response = self
-                                    .vm_reboot()
-                                    .map_err(ApiError::VmReboot)
-                                    .map(|_| ApiResponsePayload::Empty);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmInfo(sender) => {
+                                    let response = self
+                                        .vm_info()
+                                        .map_err(ApiError::VmInfo)
+                                        .map(ApiResponsePayload::VmInfo);
 
-                                sender.send(response).map_err(Error::ApiResponseSend)?;
-                            }
-                            ApiRequest::VmInfo(sender) => {
-                                let response = self
-                                    .vm_info()
-                                    .map_err(ApiError::VmInfo)
-                                    .map(ApiResponsePayload::VmInfo);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmmPing(sender) => {
+                                    let response = ApiResponsePayload::VmmPing(self.vmm_ping());
 
-                                sender.send(response).map_err(Error::ApiResponseSend)?;
-                            }
-                            ApiRequest::VmmPing(sender) => {
-                                let response = ApiResponsePayload::VmmPing(self.vmm_ping());
+                                    sender.send(Ok(response)).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmPause(sender) => {
+                                    let response = self
+                                        .vm_pause()
+                                        .map_err(ApiError::VmPause)
+                                        .map(|_| ApiResponsePayload::Empty);
 
-                                sender.send(Ok(response)).map_err(Error::ApiResponseSend)?;
-                            }
-                            ApiRequest::VmPause(sender) => {
-                                let response = self
-                                    .vm_pause()
-                                    .map_err(ApiError::VmPause)
-                                    .map(|_| ApiResponsePayload::Empty);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmResume(sender) => {
+                                    let response = self
+                                        .vm_resume()
+                                        .map_err(ApiError::VmResume)
+                                        .map(|_| ApiResponsePayload::Empty);
 
-                                sender.send(response).map_err(Error::ApiResponseSend)?;
-                            }
-                            ApiRequest::VmResume(sender) => {
-                                let response = self
-                                    .vm_resume()
-                                    .map_err(ApiError::VmResume)
-                                    .map(|_| ApiResponsePayload::Empty);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmSnapshot(snapshot_data, sender) => {
+                                    let response = self
+                                        .vm_snapshot(&snapshot_data.destination_url)
+                                        .map_err(ApiError::VmSnapshot)
+                                        .map(|_| ApiResponsePayload::Empty);
 
-                                sender.send(response).map_err(Error::ApiResponseSend)?;
-                            }
-                            ApiRequest::VmSnapshot(snapshot_data, sender) => {
-                                let response = self
-                                    .vm_snapshot(&snapshot_data.destination_url)
-                                    .map_err(ApiError::VmSnapshot)
-                                    .map(|_| ApiResponsePayload::Empty);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmRestore(restore_data, sender) => {
+                                    let response = self
+                                        .vm_restore(restore_data.as_ref().clone())
+                                        .map_err(ApiError::VmRestore)
+                                        .map(|_| ApiResponsePayload::Empty);
 
-                                sender.send(response).map_err(Error::ApiResponseSend)?;
-                            }
-                            ApiRequest::VmRestore(restore_data, sender) => {
-                                let response = self
-                                    .vm_restore(restore_data.as_ref().clone())
-                                    .map_err(ApiError::VmRestore)
-                                    .map(|_| ApiResponsePayload::Empty);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                #[cfg(feature = "guest_debug")]
+                                ApiRequest::VmCoredump(coredump_data, sender) => {
+                                    let response = self
+                                        .vm_coredump(&coredump_data.destination_url)
+                                        .map_err(ApiError::VmCoredump)
+                                        .map(|_| ApiResponsePayload::Empty);
 
-                                sender.send(response).map_err(Error::ApiResponseSend)?;
-                            }
-                            #[cfg(feature = "guest_debug")]
-                            ApiRequest::VmCoredump(coredump_data, sender) => {
-                                let response = self
-                                    .vm_coredump(&coredump_data.destination_url)
-                                    .map_err(ApiError::VmCoredump)
-                                    .map(|_| ApiResponsePayload::Empty);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmmShutdown(sender) => {
+                                    let response = self
+                                        .vmm_shutdown()
+                                        .map_err(ApiError::VmmShutdown)
+                                        .map(|_| ApiResponsePayload::Empty);
 
-                                sender.send(response).map_err(Error::ApiResponseSend)?;
-                            }
-                            ApiRequest::VmmShutdown(sender) => {
-                                let response = self
-                                    .vmm_shutdown()
-                                    .map_err(ApiError::VmmShutdown)
-                                    .map(|_| ApiResponsePayload::Empty);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
 
-                                sender.send(response).map_err(Error::ApiResponseSend)?;
+                                    break 'outer;
+                                }
+                                ApiRequest::VmResize(resize_data, sender) => {
+                                    let response = self
+                                        .vm_resize(
+                                            resize_data.desired_vcpus,
+                                            resize_data.desired_ram,
+                                            resize_data.desired_balloon,
+                                        )
+                                        .map_err(ApiError::VmResize)
+                                        .map(|_| ApiResponsePayload::Empty);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmResizeZone(resize_zone_data, sender) => {
+                                    let response = self
+                                        .vm_resize_zone(
+                                            resize_zone_data.id.clone(),
+                                            resize_zone_data.desired_ram,
+                                        )
+                                        .map_err(ApiError::VmResizeZone)
+                                        .map(|_| ApiResponsePayload::Empty);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmAddDevice(add_device_data, sender) => {
+                                    let response = self
+                                        .vm_add_device(add_device_data.as_ref().clone())
+                                        .map_err(ApiError::VmAddDevice)
+                                        .map(ApiResponsePayload::VmAction);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmAddUserDevice(add_device_data, sender) => {
+                                    let response = self
+                                        .vm_add_user_device(add_device_data.as_ref().clone())
+                                        .map_err(ApiError::VmAddUserDevice)
+                                        .map(ApiResponsePayload::VmAction);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmRemoveDevice(remove_device_data, sender) => {
+                                    let response = self
+                                        .vm_remove_device(remove_device_data.id.clone())
+                                        .map_err(ApiError::VmRemoveDevice)
+                                        .map(|_| ApiResponsePayload::Empty);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmAddDisk(add_disk_data, sender) => {
+                                    let response = self
+                                        .vm_add_disk(add_disk_data.as_ref().clone())
+                                        .map_err(ApiError::VmAddDisk)
+                                        .map(ApiResponsePayload::VmAction);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmAddFs(add_fs_data, sender) => {
+                                    let response = self
+                                        .vm_add_fs(add_fs_data.as_ref().clone())
+                                        .map_err(ApiError::VmAddFs)
+                                        .map(ApiResponsePayload::VmAction);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmAddPmem(add_pmem_data, sender) => {
+                                    let response = self
+                                        .vm_add_pmem(add_pmem_data.as_ref().clone())
+                                        .map_err(ApiError::VmAddPmem)
+                                        .map(ApiResponsePayload::VmAction);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmAddNet(add_net_data, sender) => {
+                                    let response = self
+                                        .vm_add_net(add_net_data.as_ref().clone())
+                                        .map_err(ApiError::VmAddNet)
+                                        .map(ApiResponsePayload::VmAction);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmAddVdpa(add_vdpa_data, sender) => {
+                                    let response = self
+                                        .vm_add_vdpa(add_vdpa_data.as_ref().clone())
+                                        .map_err(ApiError::VmAddVdpa)
+                                        .map(ApiResponsePayload::VmAction);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmAddVsock(add_vsock_data, sender) => {
+                                    let response = self
+                                        .vm_add_vsock(add_vsock_data.as_ref().clone())
+                                        .map_err(ApiError::VmAddVsock)
+                                        .map(ApiResponsePayload::VmAction);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmCounters(sender) => {
+                                    let response = self
+                                        .vm_counters()
+                                        .map_err(ApiError::VmInfo)
+                                        .map(ApiResponsePayload::VmAction);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmReceiveMigration(receive_migration_data, sender) => {
+                                    let response = self
+                                        .vm_receive_migration(
+                                            receive_migration_data.as_ref().clone(),
+                                        )
+                                        .map_err(ApiError::VmReceiveMigration)
+                                        .map(|_| ApiResponsePayload::Empty);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmSendMigration(send_migration_data, sender) => {
+                                    let response = self
+                                        .vm_send_migration(send_migration_data.as_ref().clone())
+                                        .map_err(ApiError::VmSendMigration)
+                                        .map(|_| ApiResponsePayload::Empty);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmPowerButton(sender) => {
+                                    let response = self
+                                        .vm_power_button()
+                                        .map_err(ApiError::VmPowerButton)
+                                        .map(|_| ApiResponsePayload::Empty);
 
-                                break 'outer;
-                            }
-                            ApiRequest::VmResize(resize_data, sender) => {
-                                let response = self
-                                    .vm_resize(
-                                        resize_data.desired_vcpus,
-                                        resize_data.desired_ram,
-                                        resize_data.desired_balloon,
-                                    )
-                                    .map_err(ApiError::VmResize)
-                                    .map(|_| ApiResponsePayload::Empty);
-                                sender.send(response).map_err(Error::ApiResponseSend)?;
-                            }
-                            ApiRequest::VmResizeZone(resize_zone_data, sender) => {
-                                let response = self
-                                    .vm_resize_zone(
-                                        resize_zone_data.id.clone(),
-                                        resize_zone_data.desired_ram,
-                                    )
-                                    .map_err(ApiError::VmResizeZone)
-                                    .map(|_| ApiResponsePayload::Empty);
-                                sender.send(response).map_err(Error::ApiResponseSend)?;
-                            }
-                            ApiRequest::VmAddDevice(add_device_data, sender) => {
-                                let response = self
-                                    .vm_add_device(add_device_data.as_ref().clone())
-                                    .map_err(ApiError::VmAddDevice)
-                                    .map(ApiResponsePayload::VmAction);
-                                sender.send(response).map_err(Error::ApiResponseSend)?;
-                            }
-                            ApiRequest::VmAddUserDevice(add_device_data, sender) => {
-                                let response = self
-                                    .vm_add_user_device(add_device_data.as_ref().clone())
-                                    .map_err(ApiError::VmAddUserDevice)
-                                    .map(ApiResponsePayload::VmAction);
-                                sender.send(response).map_err(Error::ApiResponseSend)?;
-                            }
-                            ApiRequest::VmRemoveDevice(remove_device_data, sender) => {
-                                let response = self
-                                    .vm_remove_device(remove_device_data.id.clone())
-                                    .map_err(ApiError::VmRemoveDevice)
-                                    .map(|_| ApiResponsePayload::Empty);
-                                sender.send(response).map_err(Error::ApiResponseSend)?;
-                            }
-                            ApiRequest::VmAddDisk(add_disk_data, sender) => {
-                                let response = self
-                                    .vm_add_disk(add_disk_data.as_ref().clone())
-                                    .map_err(ApiError::VmAddDisk)
-                                    .map(ApiResponsePayload::VmAction);
-                                sender.send(response).map_err(Error::ApiResponseSend)?;
-                            }
-                            ApiRequest::VmAddFs(add_fs_data, sender) => {
-                                let response = self
-                                    .vm_add_fs(add_fs_data.as_ref().clone())
-                                    .map_err(ApiError::VmAddFs)
-                                    .map(ApiResponsePayload::VmAction);
-                                sender.send(response).map_err(Error::ApiResponseSend)?;
-                            }
-                            ApiRequest::VmAddPmem(add_pmem_data, sender) => {
-                                let response = self
-                                    .vm_add_pmem(add_pmem_data.as_ref().clone())
-                                    .map_err(ApiError::VmAddPmem)
-                                    .map(ApiResponsePayload::VmAction);
-                                sender.send(response).map_err(Error::ApiResponseSend)?;
-                            }
-                            ApiRequest::VmAddNet(add_net_data, sender) => {
-                                let response = self
-                                    .vm_add_net(add_net_data.as_ref().clone())
-                                    .map_err(ApiError::VmAddNet)
-                                    .map(ApiResponsePayload::VmAction);
-                                sender.send(response).map_err(Error::ApiResponseSend)?;
-                            }
-                            ApiRequest::VmAddVdpa(add_vdpa_data, sender) => {
-                                let response = self
-                                    .vm_add_vdpa(add_vdpa_data.as_ref().clone())
-                                    .map_err(ApiError::VmAddVdpa)
-                                    .map(ApiResponsePayload::VmAction);
-                                sender.send(response).map_err(Error::ApiResponseSend)?;
-                            }
-                            ApiRequest::VmAddVsock(add_vsock_data, sender) => {
-                                let response = self
-                                    .vm_add_vsock(add_vsock_data.as_ref().clone())
-                                    .map_err(ApiError::VmAddVsock)
-                                    .map(ApiResponsePayload::VmAction);
-                                sender.send(response).map_err(Error::ApiResponseSend)?;
-                            }
-                            ApiRequest::VmCounters(sender) => {
-                                let response = self
-                                    .vm_counters()
-                                    .map_err(ApiError::VmInfo)
-                                    .map(ApiResponsePayload::VmAction);
-                                sender.send(response).map_err(Error::ApiResponseSend)?;
-                            }
-                            ApiRequest::VmReceiveMigration(receive_migration_data, sender) => {
-                                let response = self
-                                    .vm_receive_migration(receive_migration_data.as_ref().clone())
-                                    .map_err(ApiError::VmReceiveMigration)
-                                    .map(|_| ApiResponsePayload::Empty);
-                                sender.send(response).map_err(Error::ApiResponseSend)?;
-                            }
-                            ApiRequest::VmSendMigration(send_migration_data, sender) => {
-                                let response = self
-                                    .vm_send_migration(send_migration_data.as_ref().clone())
-                                    .map_err(ApiError::VmSendMigration)
-                                    .map(|_| ApiResponsePayload::Empty);
-                                sender.send(response).map_err(Error::ApiResponseSend)?;
-                            }
-                            ApiRequest::VmPowerButton(sender) => {
-                                let response = self
-                                    .vm_power_button()
-                                    .map_err(ApiError::VmPowerButton)
-                                    .map(|_| ApiResponsePayload::Empty);
-
-                                sender.send(response).map_err(Error::ApiResponseSend)?;
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
                             }
                         }
                     }
                     #[cfg(feature = "gdb")]
                     EpollDispatch::Debug => {
-                        // Consume the event.
-                        self.debug_evt.read().map_err(Error::EventFdRead)?;
+                        // Consume the events.
+                        for _ in 0..self.debug_evt.read().map_err(Error::EventFdRead)? {
+                            // Read from the API receiver channel
+                            let gdb_request = gdb_receiver.recv().map_err(Error::GdbRequestRecv)?;
 
-                        // Read from the API receiver channel
-                        let gdb_request = gdb_receiver.recv().map_err(Error::GdbRequestRecv)?;
+                            let response = if let Some(ref mut vm) = self.vm {
+                                vm.debug_request(&gdb_request.payload, gdb_request.cpu_id)
+                            } else {
+                                Err(VmError::VmNotRunning)
+                            }
+                            .map_err(gdb::Error::Vm);
 
-                        let response = if let Some(ref mut vm) = self.vm {
-                            vm.debug_request(&gdb_request.payload, gdb_request.cpu_id)
-                        } else {
-                            Err(VmError::VmNotRunning)
+                            gdb_request
+                                .sender
+                                .send(response)
+                                .map_err(Error::GdbResponseSend)?;
                         }
-                        .map_err(gdb::Error::Vm);
-
-                        gdb_request
-                            .sender
-                            .send(response)
-                            .map_err(Error::GdbResponseSend)?;
                     }
                     #[cfg(not(feature = "gdb"))]
                     EpollDispatch::Debug => {}
                 }
             }
+        }
+
+        // Trigger the termination of the signal_handler thread
+        if let Some(signals) = self.signals.take() {
+            signals.close();
+        }
+
+        // Wait for all the threads to finish
+        for thread in self.threads.drain(..) {
+            thread.join().map_err(Error::ThreadCleanup)?
         }
 
         Ok(())

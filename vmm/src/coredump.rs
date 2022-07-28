@@ -4,9 +4,7 @@
 //
 
 #[cfg(target_arch = "x86_64")]
-use hypervisor::kvm::kvm_bindings::kvm_dtable as DTableRegister;
-#[cfg(target_arch = "x86_64")]
-use hypervisor::x86_64::SegmentRegister;
+use hypervisor::arch::x86::{DescriptorTable, SegmentRegister};
 use linux_loader::elf;
 use std::fs::File;
 use std::io::Write;
@@ -135,7 +133,7 @@ impl CpuSegment {
         }
     }
 
-    pub fn new_from_table(reg: DTableRegister) -> Self {
+    pub fn new_from_table(reg: DescriptorTable) -> Self {
         CpuSegment {
             selector: 0,
             limit: reg.limit as u32,
@@ -174,9 +172,9 @@ pub struct CpuState {
 unsafe impl ByteValued for CpuState {}
 
 pub enum NoteDescType {
-    ElfDesc = 0,
-    VmmDesc = 1,
-    ElfAndVmmDesc = 2,
+    Elf = 0,
+    Vmm = 1,
+    ElfAndVmm = 2,
 }
 
 // "CORE" or "QEMU"
@@ -239,7 +237,7 @@ pub trait Elf64Writable {
         let bytes: &[u8] = elf64_ehdr.as_slice();
         coredump_file
             .write(bytes)
-            .map_err(|e| GuestDebuggableError::CoredumpFile(e.into()))?;
+            .map_err(GuestDebuggableError::CoredumpFile)?;
 
         Ok(())
     }
@@ -264,7 +262,7 @@ pub trait Elf64Writable {
         let bytes: &[u8] = elf64_phdr.as_slice();
         coredump_file
             .write(bytes)
-            .map_err(|e| GuestDebuggableError::CoredumpFile(e.into()))?;
+            .map_err(GuestDebuggableError::CoredumpFile)?;
 
         Ok(())
     }
@@ -292,7 +290,7 @@ pub trait Elf64Writable {
         let bytes: &[u8] = elf64_load.as_slice();
         coredump_file
             .write(bytes)
-            .map_err(|e| GuestDebuggableError::CoredumpFile(e.into()))?;
+            .map_err(GuestDebuggableError::CoredumpFile)?;
 
         Ok(())
     }
@@ -324,9 +322,9 @@ pub trait Elf64Writable {
             self.elf_note_size(note_head_size, COREDUMP_NAME_SIZE, cpu_state_desc_size);
 
         match desc_type {
-            NoteDescType::ElfDesc => elf_note_size * nr_cpus,
-            NoteDescType::VmmDesc => vmm_note_size * nr_cpus,
-            NoteDescType::ElfAndVmmDesc => (elf_note_size + vmm_note_size) * nr_cpus,
+            NoteDescType::Elf => elf_note_size * nr_cpus,
+            NoteDescType::Vmm => vmm_note_size * nr_cpus,
+            NoteDescType::ElfAndVmm => (elf_note_size + vmm_note_size) * nr_cpus,
         }
     }
 }

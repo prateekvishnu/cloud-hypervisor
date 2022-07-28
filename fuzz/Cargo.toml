@@ -10,16 +10,18 @@ cargo-fuzz = true
 
 [dependencies]
 block_util = { path = "../block_util" }
+devices = { path = "../devices" }
 libc = "0.2.126"
 libfuzzer-sys = "0.4.3"
 qcow = { path = "../qcow" }
 seccompiler = "0.2.0"
 vhdx = { path = "../vhdx" }
 virtio-devices = { path = "../virtio-devices" }
-virtio-queue = "0.3.0"
-vmm-sys-util = "0.9.0"
-vm-virtio = { path = "../vm-virtio" }
+virtio-queue = "0.4.0"
+vmm-sys-util = "0.10.0"
 vm-memory = "0.8.0"
+vm-device = { path = "../vm-device" }
+vm-virtio = { path = "../vm-virtio" }
 
 [dependencies.cloud-hypervisor]
 path = ".."
@@ -34,14 +36,26 @@ versionize_derive = { git = "https://github.com/cloud-hypervisor/versionize_deri
 members = ["."]
 
 [[bin]]
+name = "block"
+path = "fuzz_targets/block.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "cmos"
+path = "fuzz_targets/cmos.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "qcow"
 path = "fuzz_targets/qcow.rs"
 test = false
 doc = false
 
 [[bin]]
-name = "block"
-path = "fuzz_targets/block.rs"
+name = "serial"
+path = "fuzz_targets/serial.rs"
 test = false
 doc = false
 
@@ -50,3 +64,4 @@ name = "vhdx"
 path = "fuzz_targets/vhdx.rs"
 test = false
 doc = false
+

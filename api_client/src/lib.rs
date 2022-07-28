@@ -101,6 +101,10 @@ fn parse_http_response(socket: &mut dyn Read) -> Result<Option<String>, Error> {
     loop {
         let mut bytes = vec![0; 256];
         let count = socket.read(&mut bytes).map_err(Error::Socket)?;
+        // If the return value is 0, the peer has performed an orderly shutdown.
+        if count == 0 {
+            break;
+        }
         res.push_str(std::str::from_utf8(&bytes[0..count]).unwrap());
 
         // End of headers
@@ -127,7 +131,7 @@ fn parse_http_response(socket: &mut dyn Read) -> Result<Option<String>, Error> {
             }
         }
     }
-    let body_string = content_length.and(Some(String::from(&res[body_offset.unwrap()..])));
+    let body_string = content_length.and(body_offset.map(|o| String::from(&res[o..])));
     let status_code = get_status_code(&res)?;
 
     if status_code.is_server_error() {

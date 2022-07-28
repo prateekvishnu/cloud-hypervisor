@@ -30,7 +30,7 @@ use crate::memory_manager::{
 };
 #[cfg(feature = "guest_debug")]
 use crate::migration::url_to_file;
-use crate::migration::{get_vm_snapshot, url_to_path, SNAPSHOT_CONFIG_FILE, SNAPSHOT_STATE_FILE};
+use crate::migration::{url_to_path, SNAPSHOT_CONFIG_FILE, SNAPSHOT_STATE_FILE};
 use crate::seccomp_filters::{get_seccomp_filter, Thread};
 use crate::GuestMemoryMmap;
 use crate::{
@@ -64,11 +64,7 @@ use linux_loader::loader::pe::Error::InvalidImageMagicNumber;
 use linux_loader::loader::KernelLoader;
 use seccompiler::{apply_filter, SeccompAction};
 use serde::{Deserialize, Serialize};
-use signal_hook::{
-    consts::{SIGINT, SIGTERM, SIGWINCH},
-    iterator::backend::Handle,
-    iterator::Signals,
-};
+use signal_hook::{consts::SIGWINCH, iterator::backend::Handle, iterator::Signals};
 use std::cmp;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -309,7 +305,7 @@ pub enum Error {
 }
 pub type Result<T> = result::Result<T, Error>;
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum VmState {
     Created,
     Running,
@@ -455,8 +451,6 @@ pub fn physical_bits(max_phys_bits: u8) -> u8 {
     cmp::min(host_phys_bits, max_phys_bits)
 }
 
-pub const HANDLED_SIGNALS: [i32; 3] = [SIGWINCH, SIGTERM, SIGINT];
-
 pub struct Vm {
     #[cfg(any(target_arch = "aarch64", feature = "tdx"))]
     kernel: Option<File>,
@@ -477,7 +471,6 @@ pub struct Vm {
     numa_nodes: NumaNodes,
     seccomp_action: SeccompAction,
     exit_evt: EventFd,
-    #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
     stop_on_boot: bool,
     #[cfg(target_arch = "x86_64")]
@@ -485,6 +478,8 @@ pub struct Vm {
 }
 
 impl Vm {
+    pub const HANDLED_SIGNALS: [i32; 1] = [SIGWINCH];
+
     #[allow(clippy::too_many_arguments)]
     fn new_from_memory_manager(
         config: Arc<Mutex<VmConfig>>,
@@ -538,6 +533,7 @@ impl Vm {
         let stop_on_boot = false;
 
         let device_manager = DeviceManager::new(
+            hypervisor.hypervisor_type(),
             vm.clone(),
             config.clone(),
             memory_manager.clone(),
@@ -621,7 +617,6 @@ impl Vm {
             numa_nodes,
             seccomp_action: seccomp_action.clone(),
             exit_evt,
-            #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
             hypervisor,
             stop_on_boot,
             #[cfg(target_arch = "x86_64")]
@@ -815,12 +810,6 @@ impl Vm {
                 .unwrap();
             vm.set_tss_address(KVM_TSS_START.0 as usize).unwrap();
             vm.enable_split_irq().unwrap();
-        }
-
-        let vm_snapshot = get_vm_snapshot(snapshot).map_err(Error::Restore)?;
-        if let Some(state) = vm_snapshot.state {
-            vm.set_state(state)
-                .map_err(|e| Error::Restore(MigratableError::Restore(e.into())))?;
         }
 
         let memory_manager = if let Some(memory_manager_snapshot) =
@@ -1678,33 +1667,14 @@ impl Vm {
         Ok(self.device_manager.lock().unwrap().counters())
     }
 
-    fn os_signal_handler(
-        mut signals: Signals,
-        console_input_clone: Arc<Console>,
-        on_tty: bool,
-        exit_evt: &EventFd,
-    ) {
-        for sig in &HANDLED_SIGNALS {
+    fn signal_handler(mut signals: Signals, console_input_clone: Arc<Console>) {
+        for sig in &Vm::HANDLED_SIGNALS {
             unblock_signal(*sig).unwrap();
         }
 
         for signal in signals.forever() {
-            match signal {
-                SIGWINCH => {
-                    console_input_clone.update_console_size();
-                }
-                SIGTERM | SIGINT => {
-                    if on_tty {
-                        io::stdin()
-                            .lock()
-                            .set_canon_mode()
-                            .expect("failed to restore terminal mode");
-                    }
-                    if exit_evt.write(1).is_err() {
-                        std::process::exit(1);
-                    }
-                }
-                _ => (),
+            if signal == SIGWINCH {
+                console_input_clone.update_console_size();
             }
         }
     }
@@ -1993,18 +1963,20 @@ impl Vm {
 
     fn setup_signal_handler(&mut self) -> Result<()> {
         let console = self.device_manager.lock().unwrap().console().clone();
-        let signals = Signals::new(&HANDLED_SIGNALS);
+        let signals = Signals::new(&Vm::HANDLED_SIGNALS);
         match signals {
             Ok(signals) => {
                 self.signals = Some(signals.handle());
                 let exit_evt = self.exit_evt.try_clone().map_err(Error::EventFdClone)?;
-                let on_tty = self.on_tty;
-                let signal_handler_seccomp_filter =
-                    get_seccomp_filter(&self.seccomp_action, Thread::SignalHandler)
-                        .map_err(Error::CreateSeccompFilter)?;
+                let signal_handler_seccomp_filter = get_seccomp_filter(
+                    &self.seccomp_action,
+                    Thread::SignalHandler,
+                    self.hypervisor.hypervisor_type(),
+                )
+                .map_err(Error::CreateSeccompFilter)?;
                 self.threads.push(
                     thread::Builder::new()
-                        .name("signal_handler".to_string())
+                        .name("vm_signal_handler".to_string())
                         .spawn(move || {
                             if !signal_handler_seccomp_filter.is_empty() {
                                 if let Err(e) = apply_filter(&signal_handler_seccomp_filter)
@@ -2016,7 +1988,7 @@ impl Vm {
                                 }
                             }
                             std::panic::catch_unwind(AssertUnwindSafe(|| {
-                                Vm::os_signal_handler(signals, console, on_tty, &exit_evt);
+                                Vm::signal_handler(signals, console);
                             }))
                             .map_err(|_| {
                                 error!("signal_handler thead panicked");
@@ -2171,13 +2143,11 @@ impl Vm {
             self.vm.tdx_finalize().map_err(Error::FinalizeTdx)?;
         }
 
-        if new_state == VmState::Running {
-            self.cpu_manager
-                .lock()
-                .unwrap()
-                .start_boot_vcpus()
-                .map_err(Error::CpuManager)?;
-        }
+        self.cpu_manager
+            .lock()
+            .unwrap()
+            .start_boot_vcpus(new_state == VmState::BreakPoint)
+            .map_err(Error::CpuManager)?;
 
         let mut state = self.state.try_write().map_err(|_| Error::PoisonedState)?;
         *state = new_state;
@@ -2204,6 +2174,7 @@ impl Vm {
         &mut self,
         snapshot: &Snapshot,
     ) -> Result<Option<hypervisor::ClockData>> {
+        use crate::migration::get_vm_snapshot;
         let vm_snapshot = get_vm_snapshot(snapshot).map_err(Error::Restore)?;
         self.saved_clock = vm_snapshot.clock;
         Ok(self.saved_clock)
@@ -2531,8 +2502,8 @@ impl Vm {
         destination_url: &str,
     ) -> std::result::Result<DumpState, GuestDebuggableError> {
         let nr_cpus = self.config.lock().unwrap().cpus.boot_vcpus as u32;
-        let elf_note_size = self.get_note_size(NoteDescType::ElfAndVmmDesc, nr_cpus) as isize;
-        let mut elf_phdr_num = 1 as u16;
+        let elf_note_size = self.get_note_size(NoteDescType::ElfAndVmm, nr_cpus) as isize;
+        let mut elf_phdr_num = 1;
         let elf_sh_info = 0;
         let coredump_file_path = url_to_file(destination_url)?;
         let mapping_num = self.memory_manager.lock().unwrap().num_guest_ram_mappings();
@@ -2593,8 +2564,7 @@ impl Pausable for Vm {
                 .vm
                 .get_clock()
                 .map_err(|e| MigratableError::Pause(anyhow!("Could not get VM clock: {}", e)))?;
-            // Reset clock flags.
-            clock.flags = 0;
+            clock.reset_flags();
             self.saved_clock = Some(clock);
         }
 
@@ -2647,9 +2617,8 @@ impl Pausable for Vm {
 pub struct VmSnapshot {
     #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
     pub clock: Option<hypervisor::ClockData>,
-    pub state: Option<hypervisor::VmState>,
     #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
-    pub common_cpuid: hypervisor::x86_64::CpuId,
+    pub common_cpuid: Vec<hypervisor::arch::x86::CpuIdEntry>,
 }
 
 pub const VM_SNAPSHOT_ID: &str = "vm";
@@ -2697,14 +2666,9 @@ impl Snapshottable for Vm {
         };
 
         let mut vm_snapshot = Snapshot::new(VM_SNAPSHOT_ID);
-        let vm_state = self
-            .vm
-            .state()
-            .map_err(|e| MigratableError::Snapshot(e.into()))?;
         let vm_snapshot_data = serde_json::to_vec(&VmSnapshot {
             #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
             clock: self.saved_clock,
-            state: Some(vm_state),
             #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
             common_cpuid,
         })
@@ -2919,9 +2883,10 @@ impl Debuggable for Vm {
     }
 
     fn debug_pause(&mut self) -> std::result::Result<(), DebuggableError> {
-        if !self.cpu_manager.lock().unwrap().vcpus_paused() {
+        if *self.state.read().unwrap() == VmState::Running {
             self.pause().map_err(DebuggableError::Pause)?;
         }
+
         let mut state = self
             .state
             .try_write()
@@ -2931,25 +2896,10 @@ impl Debuggable for Vm {
     }
 
     fn debug_resume(&mut self) -> std::result::Result<(), DebuggableError> {
-        if !self.cpu_manager.lock().unwrap().vcpus_paused() {
-            self.cpu_manager
-                .lock()
-                .unwrap()
-                .start_boot_vcpus()
-                .map_err(|e| {
-                    DebuggableError::Resume(MigratableError::Resume(anyhow!(
-                        "Could not start boot vCPUs: {:?}",
-                        e
-                    )))
-                })?;
-        } else {
-            self.resume().map_err(DebuggableError::Resume)?;
+        if *self.state.read().unwrap() == VmState::BreakPoint {
+            self.resume().map_err(DebuggableError::Pause)?;
         }
-        let mut state = self
-            .state
-            .try_write()
-            .map_err(|_| DebuggableError::PoisonedState)?;
-        *state = VmState::Running;
+
         Ok(())
     }
 

@@ -16,8 +16,7 @@ use crate::config::{
 use crate::device_tree::{DeviceNode, DeviceTree};
 use crate::interrupt::LegacyUserspaceInterruptManager;
 use crate::interrupt::MsiInterruptManager;
-use crate::memory_manager::MEMORY_MANAGER_ACPI_SIZE;
-use crate::memory_manager::{Error as MemoryManagerError, MemoryManager};
+use crate::memory_manager::{Error as MemoryManagerError, MemoryManager, MEMORY_MANAGER_ACPI_SIZE};
 use crate::pci_segment::PciSegment;
 use crate::seccomp_filters::{get_seccomp_filter, Thread};
 use crate::serial_manager::{Error as SerialManagerError, SerialManager};
@@ -27,6 +26,7 @@ use crate::GuestMemoryMmap;
 use crate::GuestRegionMmap;
 use crate::PciDeviceInfo;
 use crate::{device_node, DEVICE_MANAGER_SNAPSHOT_ID};
+use acpi_tables::sdt::GenericAddress;
 use acpi_tables::{aml, aml::Aml};
 use anyhow::anyhow;
 use arch::layout;
@@ -51,7 +51,7 @@ use devices::legacy::Serial;
 use devices::{
     interrupt_controller, interrupt_controller::InterruptController, AcpiNotificationFlags,
 };
-use hypervisor::{DeviceFd, HypervisorVmError, IoEventAddress};
+use hypervisor::{HypervisorType, HypervisorVmError, IoEventAddress};
 use libc::{
     cfmakeraw, isatty, tcgetattr, tcsetattr, termios, MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED,
     O_TMPFILE, PROT_READ, PROT_WRITE, TCSANOW,
@@ -76,7 +76,7 @@ use std::path::PathBuf;
 use std::result;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use vfio_ioctls::{VfioContainer, VfioDevice};
+use vfio_ioctls::{VfioContainer, VfioDevice, VfioDeviceFd};
 use virtio_devices::transport::VirtioTransport;
 use virtio_devices::transport::{VirtioPciDevice, VirtioPciDeviceActivator};
 use virtio_devices::vhost_user::VhostUserConfig;
@@ -357,9 +357,6 @@ pub enum DeviceManagerError {
 
     /// Could not give the PCI device ID back.
     PutPciDeviceId(pci::PciRootError),
-
-    /// Incorrect device ID as it is already used by another device.
-    DeviceIdAlreadyInUse,
 
     /// No disk path was specified when one was expected
     NoDiskPath,
@@ -810,7 +807,18 @@ struct MetaVirtioDevice {
     dma_handler: Option<Arc<dyn ExternalDmaMapping>>,
 }
 
+#[derive(Default)]
+pub struct AcpiPlatformAddresses {
+    pub pm_timer_address: Option<GenericAddress>,
+    pub reset_reg_address: Option<GenericAddress>,
+    pub sleep_control_reg_address: Option<GenericAddress>,
+    pub sleep_status_reg_address: Option<GenericAddress>,
+}
+
 pub struct DeviceManager {
+    // The underlying hypervisor
+    hypervisor_type: HypervisorType,
+
     // Manage address space related to devices
     address_manager: Arc<AddressManager>,
 
@@ -871,7 +879,7 @@ pub struct DeviceManager {
     legacy_interrupt_manager: Option<Arc<dyn InterruptManager<GroupConfig = LegacyIrqGroupConfig>>>,
 
     // Passthrough device handle
-    passthrough_device: Option<Arc<dyn hypervisor::Device>>,
+    passthrough_device: Option<VfioDeviceFd>,
 
     // VFIO container
     // Only one container can be created, therefore it is stored as part of the
@@ -944,11 +952,15 @@ pub struct DeviceManager {
 
     // Pending activations
     pending_activations: Arc<Mutex<Vec<VirtioPciDeviceActivator>>>,
+
+    // Addresses for ACPI platform devices e.g. ACPI PM timer, sleep/reset registers
+    acpi_platform_addresses: AcpiPlatformAddresses,
 }
 
 impl DeviceManager {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        hypervisor_type: HypervisorType,
         vm: Arc<dyn hypervisor::Vm>,
         config: Arc<Mutex<VmConfig>>,
         memory_manager: Arc<Mutex<MemoryManager>>,
@@ -1039,6 +1051,7 @@ impl DeviceManager {
         }
 
         let device_manager = DeviceManager {
+            hypervisor_type,
             address_manager: Arc::clone(&address_manager),
             console: Arc::new(Console::default()),
             interrupt_controller: None,
@@ -1086,6 +1099,7 @@ impl DeviceManager {
             boot_id_list,
             timestamp,
             pending_activations: Arc::new(Mutex::new(Vec::default())),
+            acpi_platform_addresses: AcpiPlatformAddresses::default(),
         };
 
         let device_manager = Arc::new(Mutex::new(device_manager));
@@ -1408,6 +1422,12 @@ impl DeviceManager {
                 .io_bus
                 .insert(shutdown_device, 0x3c0, 0x4)
                 .map_err(DeviceManagerError::BusError)?;
+            self.acpi_platform_addresses.sleep_control_reg_address =
+                Some(GenericAddress::io_port_address::<u8>(0x3c0));
+            self.acpi_platform_addresses.sleep_status_reg_address =
+                Some(GenericAddress::io_port_address::<u8>(0x3c0));
+            self.acpi_platform_addresses.reset_reg_address =
+                Some(GenericAddress::io_port_address::<u8>(0x3c0));
         }
 
         let ged_irq = self
@@ -1467,6 +1487,9 @@ impl DeviceManager {
                 .io_bus
                 .insert(pm_timer_device, 0xb008, 0x4)
                 .map_err(DeviceManagerError::BusError)?;
+
+            self.acpi_platform_addresses.pm_timer_address =
+                Some(GenericAddress::io_port_address::<u32>(0xb008));
         }
 
         Ok(Some(ged_device))
@@ -1807,8 +1830,12 @@ impl DeviceManager {
     }
 
     fn listen_for_sigwinch_on_tty(&mut self, pty: &File) -> std::io::Result<()> {
-        let seccomp_filter =
-            get_seccomp_filter(&self.seccomp_action, Thread::PtyForeground).unwrap();
+        let seccomp_filter = get_seccomp_filter(
+            &self.seccomp_action,
+            Thread::PtyForeground,
+            self.hypervisor_type,
+        )
+        .unwrap();
 
         match start_sigwinch_listener(seccomp_filter, pty) {
             Ok(pipe) => {
@@ -2946,30 +2973,12 @@ impl DeviceManager {
             .as_ref()
             .ok_or(DeviceManagerError::NoDevicePassthroughSupport)?;
 
-        // Safe because we know the RawFd is valid.
-        //
-        // This dup() is mandatory to be able to give full ownership of the
-        // file descriptor to the DeviceFd::from_raw_fd() function later in
-        // the code.
-        //
-        // This is particularly needed so that VfioContainer will still have
-        // a valid file descriptor even if DeviceManager, and therefore the
-        // passthrough_device are dropped. In case of Drop, the file descriptor
-        // would be closed, but Linux would still have the duplicated file
-        // descriptor opened from DeviceFd, preventing from unexpected behavior
-        // where the VfioContainer would try to use a closed file descriptor.
-        let dup_device_fd = unsafe { libc::dup(passthrough_device.as_raw_fd()) };
-        if dup_device_fd == -1 {
-            return vmm_sys_util::errno::errno_result().map_err(DeviceManagerError::DupFd);
-        }
+        let dup = passthrough_device
+            .try_clone()
+            .map_err(DeviceManagerError::VfioCreate)?;
 
-        // SAFETY the raw fd conversion here is safe because:
-        //   1. When running on KVM or MSHV, passthrough_device wraps around DeviceFd.
-        //   2. The conversion here extracts the raw fd and then turns the raw fd into a DeviceFd
-        //      of the same (correct) type.
         Ok(Arc::new(
-            VfioContainer::new(Arc::new(unsafe { DeviceFd::from_raw_fd(dup_device_fd) }))
-                .map_err(DeviceManagerError::VfioCreate)?,
+            VfioContainer::new(Some(Arc::new(dup))).map_err(DeviceManagerError::VfioCreate)?,
         ))
     }
 
@@ -2978,10 +2987,6 @@ impl DeviceManager {
         device_cfg: &mut DeviceConfig,
     ) -> DeviceManagerResult<(PciBdf, String)> {
         let vfio_name = if let Some(id) = &device_cfg.id {
-            if self.device_tree.lock().unwrap().contains_key(id) {
-                return Err(DeviceManagerError::DeviceIdAlreadyInUse);
-            }
-
             id.clone()
         } else {
             let id = self.next_device_name(VFIO_DEVICE_NAME_PREFIX)?;
@@ -3081,6 +3086,8 @@ impl DeviceManager {
                 None
             };
 
+        let memory_manager = self.memory_manager.clone();
+
         let vfio_pci_device = VfioPciDevice::new(
             vfio_name.clone(),
             &self.address_manager.vm,
@@ -3090,6 +3097,8 @@ impl DeviceManager {
             legacy_interrupt_group,
             device_cfg.iommu,
             pci_device_bdf,
+            self.restoring,
+            Arc::new(move || memory_manager.lock().unwrap().allocate_memory_slot()),
         )
         .map_err(DeviceManagerError::VfioPciCreate)?;
 
@@ -3103,15 +3112,17 @@ impl DeviceManager {
             resources,
         )?;
 
-        vfio_pci_device
-            .lock()
-            .unwrap()
-            .map_mmio_regions(&self.address_manager.vm, || {
-                self.memory_manager.lock().unwrap().allocate_memory_slot()
-            })
-            .map_err(DeviceManagerError::VfioMapRegion)?;
+        // When restoring a VM, the restore codepath will take care of mapping
+        // the MMIO regions based on the information from the snapshot.
+        if !self.restoring {
+            vfio_pci_device
+                .lock()
+                .unwrap()
+                .map_mmio_regions()
+                .map_err(DeviceManagerError::VfioMapRegion)?;
+        }
 
-        let mut node = device_node!(vfio_name);
+        let mut node = device_node!(vfio_name, vfio_pci_device);
 
         // Update the device tree with correct resource information.
         node.resources = new_resources;
@@ -3206,10 +3217,6 @@ impl DeviceManager {
         device_cfg: &mut UserDeviceConfig,
     ) -> DeviceManagerResult<(PciBdf, String)> {
         let vfio_user_name = if let Some(id) = &device_cfg.id {
-            if self.device_tree.lock().unwrap().contains_key(id) {
-                return Err(DeviceManagerError::DeviceIdAlreadyInUse);
-            }
-
             id.clone()
         } else {
             let id = self.next_device_name(VFIO_USER_DEVICE_NAME_PREFIX)?;
@@ -3240,6 +3247,8 @@ impl DeviceManager {
                 .map_err(DeviceManagerError::VfioUserCreateClient)?,
         ));
 
+        let memory_manager = self.memory_manager.clone();
+
         let mut vfio_user_pci_device = VfioUserPciDevice::new(
             vfio_user_name.clone(),
             &self.address_manager.vm,
@@ -3247,6 +3256,8 @@ impl DeviceManager {
             self.msi_interrupt_manager.clone(),
             legacy_interrupt_group,
             pci_device_bdf,
+            self.restoring,
+            Arc::new(move || memory_manager.lock().unwrap().allocate_memory_slot()),
         )
         .map_err(DeviceManagerError::VfioUserCreate)?;
 
@@ -3281,17 +3292,19 @@ impl DeviceManager {
             resources,
         )?;
 
-        // Note it is required to call 'add_pci_device()' in advance to have the list of
-        // mmio regions provisioned correctly
-        vfio_user_pci_device
-            .lock()
-            .unwrap()
-            .map_mmio_regions(&self.address_manager.vm, || {
-                self.memory_manager.lock().unwrap().allocate_memory_slot()
-            })
-            .map_err(DeviceManagerError::VfioUserMapRegion)?;
+        // When restoring a VM, the restore codepath will take care of mapping
+        // the MMIO regions based on the information from the snapshot.
+        if !self.restoring {
+            // Note it is required to call 'add_pci_device()' in advance to have the list of
+            // mmio regions provisioned correctly
+            vfio_user_pci_device
+                .lock()
+                .unwrap()
+                .map_mmio_regions()
+                .map_err(DeviceManagerError::VfioUserMapRegion)?;
+        }
 
-        let mut node = device_node!(vfio_user_name);
+        let mut node = device_node!(vfio_user_name, vfio_user_pci_device);
 
         // Update the device tree with correct resource information.
         node.resources = new_resources;
@@ -4130,6 +4143,10 @@ impl DeviceManager {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn acpi_platform_addresses(&self) -> &AcpiPlatformAddresses {
+        &self.acpi_platform_addresses
     }
 }
 

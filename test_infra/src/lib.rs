@@ -3,9 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-#[macro_use]
-extern crate lazy_static;
-
+use once_cell::sync::Lazy;
 use ssh2::Session;
 use std::env;
 use std::ffi::OsStr;
@@ -52,7 +50,7 @@ pub struct GuestNetworkConfig {
 
 pub const DEFAULT_TCP_LISTENER_MESSAGE: &str = "booted";
 pub const DEFAULT_TCP_LISTENER_PORT: u16 = 8000;
-pub const DEFAULT_TCP_LISTENER_TIMEOUT: i32 = 80;
+pub const DEFAULT_TCP_LISTENER_TIMEOUT: i32 = 120;
 
 #[derive(Debug)]
 pub enum WaitForBootError {
@@ -722,9 +720,7 @@ pub fn exec_host_command_output(command: &str) -> Output {
 
 pub const PIPE_SIZE: i32 = 32 << 20;
 
-lazy_static! {
-    static ref NEXT_VM_ID: Mutex<u8> = Mutex::new(1);
-}
+static NEXT_VM_ID: Lazy<Mutex<u8>> = Lazy::new(|| Mutex::new(1));
 
 pub struct Guest {
     pub tmp_dir: TempDir,
@@ -832,30 +828,12 @@ impl Guest {
         )
     }
 
-    pub fn api_create_body(
-        &self,
-        cpu_count: u8,
-        _fw_path: &str,
-        _kernel_path: &str,
-        _kernel_cmd: &str,
-    ) -> String {
-        #[cfg(all(target_arch = "x86_64", not(feature = "mshv")))]
-        format! {"{{\"cpus\":{{\"boot_vcpus\":{},\"max_vcpus\":{}}},\"kernel\":{{\"path\":\"{}\"}},\"cmdline\":{{\"args\": \"\"}},\"net\":[{{\"ip\":\"{}\", \"mask\":\"255.255.255.0\", \"mac\":\"{}\"}}], \"disks\":[{{\"path\":\"{}\"}}, {{\"path\":\"{}\"}}]}}",
-                 cpu_count,
-                 cpu_count,
-                 _fw_path,
-                 self.network.host_ip,
-                 self.network.guest_mac,
-                 self.disk_config.disk(DiskType::OperatingSystem).unwrap().as_str(),
-                 self.disk_config.disk(DiskType::CloudInit).unwrap().as_str(),
-        }
-
-        #[cfg(any(target_arch = "aarch64", feature = "mshv"))]
+    pub fn api_create_body(&self, cpu_count: u8, kernel_path: &str, kernel_cmd: &str) -> String {
         format! {"{{\"cpus\":{{\"boot_vcpus\":{},\"max_vcpus\":{}}},\"kernel\":{{\"path\":\"{}\"}},\"cmdline\":{{\"args\": \"{}\"}},\"net\":[{{\"ip\":\"{}\", \"mask\":\"255.255.255.0\", \"mac\":\"{}\"}}], \"disks\":[{{\"path\":\"{}\"}}, {{\"path\":\"{}\"}}]}}",
                  cpu_count,
                  cpu_count,
-                 _kernel_path,
-                 _kernel_cmd,
+                 kernel_path,
+                 kernel_cmd,
                  self.network.host_ip,
                  self.network.guest_mac,
                  self.disk_config.disk(DiskType::OperatingSystem).unwrap().as_str(),
@@ -983,13 +961,6 @@ impl Guest {
         )?;
 
         Ok(())
-    }
-
-    pub fn get_entropy(&self) -> Result<u32, Error> {
-        self.ssh_command("cat /proc/sys/kernel/random/entropy_avail")?
-            .trim()
-            .parse()
-            .map_err(Error::Parsing)
     }
 
     pub fn get_pci_bridge_class(&self) -> Result<String, Error> {

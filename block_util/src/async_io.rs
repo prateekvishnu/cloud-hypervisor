@@ -8,7 +8,7 @@ use std::fs::File;
 use std::os::unix::io::AsRawFd;
 use thiserror::Error;
 use vmm_sys_util::eventfd::EventFd;
-use vmm_sys_util::{ioctl_expr, ioctl_io_nr, ioctl_ioc_nr};
+use vmm_sys_util::{ioctl_io_nr, ioctl_ioc_nr};
 
 #[derive(Error, Debug)]
 pub enum DiskFileError {
@@ -104,7 +104,7 @@ impl DiskTopology {
 
 pub type DiskFileResult<T> = std::result::Result<T, DiskFileError>;
 
-pub trait DiskFile: Send + Sync {
+pub trait DiskFile: Send {
     fn size(&mut self) -> DiskFileResult<u64>;
     fn new_async_io(&self, ring_depth: u32) -> DiskFileResult<Box<dyn AsyncIo>>;
     fn topology(&mut self) -> DiskTopology {
@@ -127,7 +127,7 @@ pub enum AsyncIoError {
 
 pub type AsyncIoResult<T> = std::result::Result<T, AsyncIoError>;
 
-pub trait AsyncIo: Send + Sync {
+pub trait AsyncIo: Send {
     fn notifier(&self) -> &EventFd;
     fn read_vectored(
         &mut self,

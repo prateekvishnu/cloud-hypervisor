@@ -8,10 +8,6 @@
 // related warnings for our quality workflow to pass.
 #![allow(dead_code)]
 
-#[cfg(target_arch = "x86_64")]
-#[macro_use]
-extern crate lazy_static;
-
 extern crate test_infra;
 
 use net_util::MacAddr;
@@ -257,8 +253,15 @@ fn remote_command(api_socket: &str, command: &str, arg: Option<&str>) -> bool {
     if let Some(arg) = arg {
         cmd.arg(arg);
     }
-
-    cmd.status().expect("Failed to launch ch-remote").success()
+    let output = cmd.output().unwrap();
+    if output.status.success() {
+        true
+    } else {
+        eprintln!("Error running ch-remote command: {:?}", &cmd);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("stderr: {}", stderr);
+        false
+    }
 }
 
 fn remote_command_w_output(api_socket: &str, command: &str, arg: Option<&str>) -> (bool, Vec<u8>) {
@@ -1618,7 +1621,7 @@ fn process_rss_kib(pid: u32) -> usize {
 // 10MB is our maximum accepted overhead.
 const MAXIMUM_VMM_OVERHEAD_KB: u32 = 10 * 1024;
 
-#[derive(PartialEq, PartialOrd)]
+#[derive(PartialEq, Eq, PartialOrd)]
 struct Counters {
     rx_bytes: u64,
     rx_frames: u64,
@@ -2000,7 +2003,6 @@ mod parallel {
             assert_eq!(guest.get_cpu_count().unwrap_or_default(), 1);
             assert_eq!(guest.get_initial_apicid().unwrap_or(1), 0);
             assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
-            assert!(guest.get_entropy().unwrap_or_default() >= 900);
             assert_eq!(guest.get_pci_bridge_class().unwrap_or_default(), "0x060000");
 
             let expected_sequential_events = [
@@ -2626,7 +2628,6 @@ mod parallel {
 
             assert_eq!(guest.get_cpu_count().unwrap_or_default(), 1);
             assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
-            assert!(guest.get_entropy().unwrap_or_default() >= 900);
 
             let grep_cmd = if cfg!(target_arch = "x86_64") {
                 "grep -c PCI-MSI /proc/interrupts"
@@ -3668,6 +3669,7 @@ mod parallel {
     #[test]
     #[cfg(target_arch = "x86_64")]
     #[cfg(not(feature = "mshv"))]
+    #[ignore = "See #4324"]
     // The VFIO integration test starts cloud-hypervisor guest with 3 TAP
     // backed networking interfaces, bound through a simple bridge on the host.
     // So if the nested cloud-hypervisor succeeds in getting a directly
@@ -3956,7 +3958,6 @@ mod parallel {
 
             assert_eq!(guest.get_cpu_count().unwrap_or_default(), 1);
             assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
-            assert!(guest.get_entropy().unwrap_or_default() >= 900);
         });
 
         let _ = child.kill();
@@ -4045,7 +4046,60 @@ mod parallel {
         let cpu_count: u8 = 4;
         let http_body = guest.api_create_body(
             cpu_count,
-            fw_path(FwType::RustHypervisorFirmware).as_str(),
+            direct_kernel_boot_path().to_str().unwrap(),
+            DIRECT_KERNEL_BOOT_CMDLINE,
+        );
+
+        let temp_config_path = guest.tmp_dir.as_path().join("config");
+        std::fs::write(&temp_config_path, http_body).unwrap();
+
+        remote_command(
+            &api_socket,
+            "create",
+            Some(temp_config_path.as_os_str().to_str().unwrap()),
+        );
+
+        // Then boot it
+        remote_command(&api_socket, "boot", None);
+        thread::sleep(std::time::Duration::new(20, 0));
+
+        let r = std::panic::catch_unwind(|| {
+            // Check that the VM booted as expected
+            assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
+            assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+        });
+
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+
+        handle_child_output(r, &output);
+    }
+
+    #[test]
+    // Start cloud-hypervisor with no VM parameters, only the API server running.
+    // From the API: Create a VM, boot it and check it can be shutdown and then
+    // booted again
+    fn test_api_shutdown() {
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+
+        let api_socket = temp_api_path(&guest.tmp_dir);
+
+        let mut child = GuestCommand::new(&guest)
+            .args(&["--api-socket", &api_socket])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        thread::sleep(std::time::Duration::new(1, 0));
+
+        // Verify API server is running
+        curl_command(&api_socket, "GET", "http://localhost/api/v1/vmm.ping", None);
+
+        // Create the VM first
+        let cpu_count: u8 = 4;
+        let http_body = guest.api_create_body(
+            cpu_count,
             direct_kernel_boot_path().to_str().unwrap(),
             DIRECT_KERNEL_BOOT_CMDLINE,
         );
@@ -4059,13 +4113,113 @@ mod parallel {
 
         // Then boot it
         curl_command(&api_socket, "PUT", "http://localhost/api/v1/vm.boot", None);
-        thread::sleep(std::time::Duration::new(20, 0));
 
         let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot(None).unwrap();
+
             // Check that the VM booted as expected
             assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
             assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
-            assert!(guest.get_entropy().unwrap_or_default() >= 900);
+
+            // Shutdown without powering off to prevent filesystem corruption
+            guest.ssh_command("sudo shutdown -H now").unwrap();
+
+            // Then shut it down
+            curl_command(
+                &api_socket,
+                "PUT",
+                "http://localhost/api/v1/vm.shutdown",
+                None,
+            );
+
+            // Then boot it again
+            curl_command(&api_socket, "PUT", "http://localhost/api/v1/vm.boot", None);
+
+            guest.wait_vm_boot(None).unwrap();
+
+            // Check that the VM booted as expected
+            assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
+            assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+        });
+
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+
+        handle_child_output(r, &output);
+    }
+
+    #[test]
+    // Start cloud-hypervisor with no VM parameters, only the API server running.
+    // From the API: Create a VM, boot it and check it can be deleted and then recreated
+    // booted again.
+    fn test_api_delete() {
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+
+        let api_socket = temp_api_path(&guest.tmp_dir);
+
+        let mut child = GuestCommand::new(&guest)
+            .args(&["--api-socket", &api_socket])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        thread::sleep(std::time::Duration::new(1, 0));
+
+        // Verify API server is running
+        curl_command(&api_socket, "GET", "http://localhost/api/v1/vmm.ping", None);
+
+        // Create the VM first
+        let cpu_count: u8 = 4;
+        let http_body = guest.api_create_body(
+            cpu_count,
+            direct_kernel_boot_path().to_str().unwrap(),
+            DIRECT_KERNEL_BOOT_CMDLINE,
+        );
+
+        let r = std::panic::catch_unwind(|| {
+            curl_command(
+                &api_socket,
+                "PUT",
+                "http://localhost/api/v1/vm.create",
+                Some(&http_body),
+            );
+
+            // Then boot it
+            curl_command(&api_socket, "PUT", "http://localhost/api/v1/vm.boot", None);
+
+            guest.wait_vm_boot(None).unwrap();
+
+            // Check that the VM booted as expected
+            assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
+            assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+
+            // Shutdown without powering off to prevent filesystem corruption
+            guest.ssh_command("sudo shutdown -H now").unwrap();
+
+            // Then delete it
+            curl_command(
+                &api_socket,
+                "PUT",
+                "http://localhost/api/v1/vm.delete",
+                None,
+            );
+
+            curl_command(
+                &api_socket,
+                "PUT",
+                "http://localhost/api/v1/vm.create",
+                Some(&http_body),
+            );
+
+            // Then boot it again
+            curl_command(&api_socket, "PUT", "http://localhost/api/v1/vm.boot", None);
+
+            guest.wait_vm_boot(None).unwrap();
+
+            // Check that the VM booted as expected
+            assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
+            assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
         });
 
         let _ = child.kill();
@@ -4100,7 +4254,6 @@ mod parallel {
         let cpu_count: u8 = 4;
         let http_body = guest.api_create_body(
             cpu_count,
-            fw_path(FwType::RustHypervisorFirmware).as_str(),
             direct_kernel_boot_path().to_str().unwrap(),
             DIRECT_KERNEL_BOOT_CMDLINE,
         );
@@ -4119,7 +4272,6 @@ mod parallel {
             // Check that the VM booted as expected
             assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
             assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
-            assert!(guest.get_entropy().unwrap_or_default() >= 900);
 
             // We now pause the VM
             assert!(remote_command(&api_socket, "pause", None));
@@ -4910,12 +5062,14 @@ mod parallel {
             assert!(orig_balloon == 2147483648);
 
             // Two steps to verify if the 'deflate_on_oom' parameter works.
-            // 1st: run a command in guest to eat up memory heavily, which
-            // will consume much more memory than $(total_mem - balloon_size)
-            // to trigger an oom.
+            // 1st: run a command to trigger an OOM in the guest.
             guest
-                .ssh_command("stress --vm 25 --vm-keep --vm-bytes 1G --timeout 20")
+                .ssh_command("echo f | sudo tee /proc/sysrq-trigger")
                 .unwrap();
+
+            // Give some time for the OOM to happen in the guest and be reported
+            // back to the host.
+            thread::sleep(std::time::Duration::new(20, 0));
 
             // 2nd: check balloon_mem's value to verify balloon has been automatically deflated
             let deflated_balloon = balloon_size(&api_socket);
@@ -6410,10 +6564,9 @@ mod sequential {
 #[cfg(target_arch = "x86_64")]
 mod windows {
     use crate::*;
+    use once_cell::sync::Lazy;
 
-    lazy_static! {
-        static ref NEXT_DISK_ID: Mutex<u8> = Mutex::new(1);
-    }
+    static NEXT_DISK_ID: Lazy<Mutex<u8>> = Lazy::new(|| Mutex::new(1));
 
     struct WindowsGuest {
         guest: Guest,
@@ -6818,6 +6971,7 @@ mod windows {
 
     #[test]
     #[cfg(not(feature = "mshv"))]
+    #[ignore = "See #4327"]
     fn test_windows_guest_snapshot_restore() {
         let windows_guest = WindowsGuest::new();
 
@@ -8368,7 +8522,6 @@ mod aarch64_acpi {
 
                 assert_eq!(guest.get_cpu_count().unwrap_or_default(), 1);
                 assert!(guest.get_total_memory().unwrap_or_default() > 400_000);
-                assert!(guest.get_entropy().unwrap_or_default() >= 900);
                 assert_eq!(guest.get_pci_bridge_class().unwrap_or_default(), "0x060000");
             });
 
